@@ -1,0 +1,37 @@
+# NOTE: install torch FIRST from the GPU index (see commands), not here.
+# torch is intentionally omitted so the AMD/NVIDIA/CPU choice stays explicit.
+
+# Unity <-> Python low-level API.
+# Pins Python 3.10, numpy>=1.23.5,<1.24, protobuf<3.21, grpcio<=1.53.2.
+# Do NOT install the full "mlagents" package: it drags in CPU torch + tensorboard
+# + onnx and will fight your GPU torch build.
+#
+# This is ML-Agents Release 23, which pairs with the Unity package
+# com.unity.ml-agents 4.0.x (the Unity 6 line). It does NOT depend on torch, so it
+# will not disturb your ROCm torch. If pip cannot build the grpcio wheel, run
+# `pip install "grpcio<=1.53.2"` first, then reinstall this line.
+mlagents-envs @ git+https://github.com/Unity-Technologies/ml-agents.git@release_23_tag#subdirectory=ml-agents-envs
+
+# Satisfies mlagents-envs (<1.24) and torch's "numpy<2" requirement at once.
+numpy==1.23.5
+
+# Graph neural network layers (GATv2Conv, global_mean_pool, global_max_pool).
+# Pure-python path is enough here; the compiled extensions (pyg-lib, torch-scatter)
+# are optional and awkward on ROCm, so they are left out.
+torch-geometric
+
+# Image decoding for the encoder preprocess and for Unity-side parity.
+Pillow
+
+# Test runner for test_kilobot.py.
+pytest
+
+# Optional: TensorBoard dashboard for launch.py metrics. Console logging works
+# without it, and metrics.Logger degrades gracefully if it is absent. Install it
+# SEPARATELY so it does not perturb the pins above:
+#   pip install "tensorboard==2.11.2"
+# (2.11.2 coexists with protobuf<3.21 and numpy 1.23.5.)
+
+# Optional: only needed to run the hyperparameter sweep (sweep.py). Training and
+# eval do not import it.
+optuna>=3.4

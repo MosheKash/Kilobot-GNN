@@ -1,0 +1,10 @@
+*.cs diff=csharp
+*.unity merge=unityyamlmerge eol=lf
+*.prefab merge=unityyamlmerge eol=lf
+*.asset merge=unityyamlmerge eol=lf
+*.meta merge=unityyamlmerge eol=lf
+*.mat merge=unityyamlmerge eol=lf
+
+*.png binary
+*.jpg binary
+*.fbx binary

@@ -1,0 +1,64 @@
+# What this repo tracks on purpose:
+#   - the Unity project source (Assets/, Packages/, ProjectSettings/)
+#   - all Python training code (python/)
+#   - the offline data-prep scripts (data-prep/) and the docs (docs/)
+#   - data/image_encoder.pt, the trained encoder -- not reproducible on demand
+#
+# What it deliberately does NOT track, and how to get each one:
+#   Builds/            build it: Unity -batchmode -quit -nographics \
+#                        -executeMethod BuildPlayer.BuildLinux
+#   data/formations/   generate it: python data-prep/quickdraw_to_png.py
+#   results/           produced by training runs
+#
+# Builds/ and data/formations/ used to be committed -- a 158 MB player and
+# 679 MB of PNGs, 99.4% of all tracked files -- even though the Dockerfile
+# already stated they were not in version control. See docs/development.md.
+
+# ─── Unity generated ──────────────────────────────────────────────────────────
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+[Aa]rtifacts/
+MemoryCaptures/
+Recordings/
+
+# ─── Build output (reproducible from Assets/Editor/BuildPlayer.cs) ────────────
+Builds/
+
+# ─── Generated datasets (reproducible from data-prep/) ────────────────────────
+data/formations/
+
+# ─── IDE ──────────────────────────────────────────────────────────────────────
+.vs/
+.vscode/
+*.csproj
+*.slnx
+*.sln
+*.suo
+*.user
+*.pidb
+*.booproj
+
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+*.egg-info/
+.pytest_cache/
+python/temp_test_material/
+
+# ─── Training output and tool output ──────────────────────────────────────────
+results/
+graphify-out/
+*.onnx
+*.log
+
+# ─── OS / misc ────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+tree.txt
+kilobot-gnn/
+kilobot-gnn.zip

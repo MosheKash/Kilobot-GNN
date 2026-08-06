@@ -1,0 +1,17 @@
+# Whitelist approach: ignore everything, then re-include only what the image
+# needs. This keeps the build context tiny (~the size of python/ + Builds/ +
+# data/) no matter what else lives in the project root - Unity Library/ and
+# Assets/, old results/, datasets, conda envs, etc. all stay out automatically.
+*
+
+!python
+!Builds
+!data
+!entrypoint.sh
+
+# Re-exclude noise inside the whitelisted directories.
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.pytest_cache
+**/.DS_Store
