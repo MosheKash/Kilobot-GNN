@@ -419,6 +419,71 @@ of every balanced minibatch.
 of the episode — which turned a single false positive into a robot frozen for
 every remaining tick, the symptom phase 154 opens with.
 
+### `arrived_freeze_hidden = True`
+
+Freezing the GRU's hidden state while a robot is switched off is right for the
+reason `use_arrived_head` gives below: nothing had ever trained the network on
+the long arrived stretches, so letting the recurrence run over thousands of
+near-identical observations drifted it somewhere it could not return from. It
+stops being right the moment something does train on them — `bc_offline.py`
+rolls each robot's whole episode, arrived included — because then a frozen
+recurrence at deployment is one the training never saw. Default left unchanged
+so no existing checkpoint changes behaviour; the offline pipeline's own
+evaluation and recording tools default it off. (phase 156)
+
+### `use_closed_form_arrived = False`, `closed_form_arrival_dist = 0.0`, `closed_form_hybrid`
+
+The learned arrived head was accurate on the tape — 0.99 recall at the deployed
+0.95 threshold, per `run_o3`'s held-out log — and useless in the field: closed
+loop, at the same threshold, it stopped 55% of the swarm late (8-arena settled
+run `eval_o3_settled.json`, 0.734 stopped) and parked only 0.303 within 5 units
+of a robot's own point. The oracle does not have this problem because its
+`arrived` is a closed form: the particle filter's own distance to the robot's
+assigned target, below `cfg.tau_v`, once localized. So the deployment gate
+became the same rule computed from the actor's observation
+(`closed_form_arrived`, kilobot_gnn), which cannot drift because nothing in it
+was learned — a closed form sequentially composes the same way the oracle-form
+head did for steering (phase 160).
+
+That almost worked and did not quite: the actor's own filter under-reports
+closeness (`d_target` ~1.5x the true distance at arrival, which is the measured
+meaning of `closed_form_arrival_dist`), so at the oracle's own `tau_v` the gate
+stopped 0.104 of the swarm and the rest orbited their points forever
+(`eval_o3_cf.json`, d<0.05). Widening the radius to 0.08 parked 0.428 with a
+0.295 settle <5u (`eval_o3_cf08.json`) — the closed form certifies tight arrivals
+but its filter only ever admits that close, so as a replacement it under-fires.
+
+The two under-fire in different places. The head stops confident robots it got
+wrong about being close; the closed form stops only certified-tight arrivals.
+`closed_form_hybrid` runs them in OR on the same tick — config.py's own
+rationale states it the way the numbers landed: the head under-fires on
+low-confidence near robots, the closed form certifies only tight arrivals, the
+two miss different robots, so the OR is strictly a superset. Terminal either
+way, like the oracle's arrived state. Closed loop the hybrid stopped 0.841 over
+8 arenas (0.844 on the ten-arena rerun) and settled 0.487 within 5 units —
+better than the oracle's own 0.416 — because it keeps the closed form's tight
+arrivals (median per-arena error 4.9u vs the oracle's 13.3u on the same eight
+arenas; 5.8u vs 12.6u on the ten-arena rerun) and the head's stopping rate.
+The `who_fires` decomposition (`tools/hybrid_report.py`) is the evidence, and it
+is honest about its own limit: the three runs are separate rollouts, so per-robot
+attribution shows where each branch fired but is not causally exact. (phase 161)
+
+### `split_activation = "relu"`
+
+Phase 154 found 13 of `head1`'s 40 outputs stuck at exactly zero for every one
+of 28392 measured decisions, and read it as an activation problem — a ReLU whose
+pre-activation is negative everywhere has no gradient to come back on, and a
+40-wide layer sized by the 24KB budget has no redundancy to absorb that. Phase
+156 ran the controlled pair (same seed, same data, `elu` against `relu`) and got
+**zero dead units in both**, with the same held-out error. The activation was
+the mechanism, not the cause: the cause is that `arrived` — half the training
+data — has the exact target `[0, 0]`, which `squash_action`'s tanh only reaches
+as its pre-activation goes to minus infinity. Drop those rows from the motor
+loss, or floor their target at 0.02, and the pressure is gone. The field stays
+because it costs nothing and a checkpoint records which value trained it; the
+default stays `relu` because that is what every earlier checkpoint used and
+because it is not the problem. (phases 154, 156)
+
 ### `use_arrived_head = False`
 
 From a direct request: "rework the actor to flip a flag when it thinks it has
@@ -613,6 +678,76 @@ duplicate-constant pattern this project has repeatedly found real bugs in
 (`SEED_SIZE`, `NODE_FEATURES`) — caught here because a test asserting the
 actor's parameter budget was silently checking a stale 48-hidden configuration
 long after config's default had changed to 59. (phase 147)
+
+### `oracle_form_motor` and why the motor command is composed rather than fitted
+
+The wheel pair the oracle emits is two orthogonal modes -- the common one
+(speed), which it holds nearly constant, and the differential one, which is the
+only thing that decides where a robot goes. During `wall_following` the
+teacher's own steering variable has a standard deviation of 0.0093, roughly 0.1% of the
+variance in the pair, so an MSE on the pair is almost entirely an MSE on the
+speed. Every clone through phase 159 exploited that: held-out motor MSE 0.0027
+with a steering R^2 of **-173**, and a correlation with the teacher's own
+steering of **-0.20**. Predicting the teacher's mean turn would have been
+better than what the network predicted.
+
+The information was never missing. `sin(latched wall tangent - belief heading)`,
+built from `prop[10:12]`, reproduces the teacher's `wall_following` turn with
+rms 8e-5 and correlation 1.0000 on 350,702 held-out decisions. What a linear
+head cannot form is the *product* of a discrete latent (which wall) with a
+continuous input (the heading) -- so the head computes it instead, mixing the
+teacher's five closed-form commands by the state head's own posterior. Zero new
+parameters, zero new inputs: `head_state`, `head_wall` and `head_motor` all
+already existed. Median steering error 0.0403 -> 0.00004. (phase 160)
+
+`--steer-weight` is the control that says this is the right diagnosis rather
+than a lucky architecture: reweighting the loss so it SEES the differential
+channel does help, 0.0403 -> 0.0112, and gets nowhere near. The channel was not
+merely underweighted; the operation was absent.
+
+### `oracle_residual_turn`'s default of zero
+
+The residual exists so the closed form is a prior rather than a cage. Left free
+to move the two wheels independently it spends itself on the SPEED -- which the
+closed form does get slightly wrong, since the approach slowdown reads the
+actor's own `conf_pos` while the teacher reads its own filter's -- and injects
+differential noise as a side effect. Swept on a trained network, the median
+`wall_following` steering error is 0.00850 at 0.003, 0.00290 at 0.001 and
+0.00058 at 0, with the motor MSE unchanged to three figures. So the two modes
+get separate scales and the differential one is off: wherever the closed form
+CAN be exact it already is, and a learned correction there only buys hedging,
+which lowers MSE and worsens the command. (phase 160)
+
+### `navigating` is the one branch that is provably not reproducible
+
+`prop[19:21]` is the sine and cosine of the bearing to the robot's own assigned
+point, relative to its own heading -- exactly the `(cross, dot)` pair
+`simple_oracle._steer` consumes. It still does not reproduce the teacher's
+command, because the teacher steers by `simple_belief`, a particle filter
+separate from the `worker.belief` that produces the observation. Measured: the
+offset between the two directions has median **-0.99 degrees**, so the formula
+is right and unbiased, with a spread of **55 degrees** and only 32% of decisions
+within 5. The control is `wall_following` on the same tape, where the latent is
+publicly recoverable: median 0.0001 degrees, 100% within 5.
+
+This is a ceiling on imitation, not a defect. The actor's own filter is an
+equally good estimate of where its target is, and steering by it is the right
+action even though it does not match the command the teacher happened to issue.
+It is also why the oracle-form head's `navigating` MSE is WORSE than a plain
+regression head's: the regression hedges toward straight-ahead, which is what
+minimises squared error against an unpredictable target and is not what a robot
+should do. (phase 160)
+
+### `widths_from_state_dict`
+
+`save_actor` recorded which heads a checkpoint was built with and nothing about
+how wide they were, so a checkpoint trained with `--gru-hidden` could not be
+loaded back: `build_actor` used config.py's default and `load_state_dict`
+rejected it. The widths are fully determined by the tensors themselves, which is
+both simpler than a new meta field and correct for every checkpoint written
+before that field existed. Found by training a 23,981-parameter variant to
+settle whether the budget is 24KB-as-int8 (24,576) or a literal 24,000, and
+being unable to score it. (phase 160)
 
 ---
 

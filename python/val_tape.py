@@ -157,9 +157,13 @@ def replay_tape(policy, tape, device = "cpu", skip_arrived = False, arrived_thre
     actor = policy.actor
     T, R = tape["valid"].shape
     h = actor.initial_hidden(R, device = device)
-    tc_all = tape["tc"].to(device)
-    prop_all = tape["prop"].to(device)
-    tgt_all = tape["tgt"].to(device)
+    # .float() because tools/record_tape.py stores the observation tensors as
+    # float16 (a training-sized tape is millions of decisions); build_tape's own
+    # tapes are already float32 and are unaffected. Without it the first matmul
+    # fails on a dtype mismatch against float32 weights.
+    tc_all = tape["tc"].to(device).float()
+    prop_all = tape["prop"].to(device).float()
+    tgt_all = tape["tgt"].to(device).float()
     valid_all = tape["valid"].to(device)
     state_all = tape["state"].to(device)
     arrived_all = tape["arrived"].to(device)

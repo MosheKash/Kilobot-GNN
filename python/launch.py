@@ -325,7 +325,7 @@ def run_eval(cfg):
                   % (all_params.numel(), float(all_params.mean()), float(all_params.std()),
                      float(all_params.min()), float(all_params.max()), nan_ct))
 
-        trainer = Trainer(env, cc, pc, cfg, encoder, pool, behavior_name, image_names = image_names)
+        trainer = Trainer(env, cc, pc, cfg, encoder, pool, behavior_name, image_names = image_names, formations_dir = FORMATIONS_DIR)
         trainer.setup()
         if EVAL_LOG:
             print("EVAL_LOG: cfg.motor_override = %r  (expect 'none' for the actor's own trained "
@@ -434,6 +434,12 @@ def main():
     # other flag on this block, so an unset variable changes nothing.
     cfg.use_arrived_head = _env_bool("KILOBOT_USE_ARRIVED_HEAD", cfg.use_arrived_head)
     cfg.use_turn_anchor = _env_bool("KILOBOT_USE_TURN_ANCHOR", cfg.use_turn_anchor)
+    # config.py's own split_activation has the rationale. Same shape of switch
+    # as the two flags above: a checkpoint trained under one activation is a
+    # different function under another, and nothing in a state_dict records
+    # which one it was, so evaluating or warm-starting from a bc_offline.py
+    # checkpoint means setting this to what its meta says.
+    cfg.split_activation = os.environ.get("KILOBOT_SPLIT_ACTIVATION", cfg.split_activation)
     # Everything run_bc_monitored.py exposes as a --flag, exposed here as an
     # environment variable, so KILOBOT_MODE=bc against real Unity trains under
     # the same pipeline as the replica rather than the pre-reservoir one.
@@ -465,6 +471,30 @@ def main():
     cfg.arrived_confidence_threshold = _env_float("KILOBOT_ARRIVED_CONFIDENCE_THRESHOLD", cfg.arrived_confidence_threshold)
     cfg.arrived_release_threshold = _env_float("KILOBOT_ARRIVED_RELEASE_THRESHOLD", getattr(cfg, "arrived_release_threshold", 0.0))
     cfg.turn_anchor_latch = _env_bool("KILOBOT_TURN_ANCHOR_LATCH", getattr(cfg, "turn_anchor_latch", True))
+    # The arrival gate, deployed: swap (or OR) the learned arrived head for the
+    # oracle's own closed-form rule (config.py's use_closed_form_arrived /
+    # closed_form_arrival_dist / closed_form_hybrid). Same default-preserving
+    # pattern as every flag above, so an unset variable changes nothing -- this
+    # is what makes a "watching the hybrid" run actually run the hybrid instead
+    # of silently the plain learned-head gate. 0 arrival distance (the Config
+    # default) means cfg.tau_v, the oracle's own rule; the actor's own filter
+    # under-reports closeness, so the hybrid's 0.08 is the measured value.
+    cfg.use_closed_form_arrived = _env_bool("KILOBOT_USE_CLOSED_FORM_ARRIVED",
+                                            getattr(cfg, "use_closed_form_arrived", False))
+    cfg.closed_form_arrival_dist = _env_float("KILOBOT_CLOSED_FORM_ARRIVAL_DIST",
+                                              getattr(cfg, "closed_form_arrival_dist", 0.0))
+    cfg.closed_form_hybrid = _env_bool("KILOBOT_CLOSED_FORM_HYBRID",
+                                       getattr(cfg, "closed_form_hybrid", False))
+    # The three auxiliary heads (arrived, state, wall) plus the oracle head and
+    # steer feature. Same direct bug the two flags above fixed: build_actor(cfg)
+    # here has no access to what a checkpoint was trained with, and load_for_eval
+    # strictly refuses a mismatch ("head_state.weight" unexpected, up1 width 40
+    # vs 42) for any watching/eval run of a bc_offline checkpoint -- which ships
+    # all of these on. _env_bool/default-preserving like the rest of the block.
+    cfg.use_state_head = _env_bool("KILOBOT_USE_STATE_HEAD", cfg.use_state_head)
+    cfg.use_wall_head = _env_bool("KILOBOT_USE_WALL_HEAD", cfg.use_wall_head)
+    cfg.use_oracle_head = _env_bool("KILOBOT_USE_ORACLE_HEAD", cfg.use_oracle_head)
+    cfg.use_steer_feature = _env_bool("KILOBOT_USE_STEER_FEATURE", cfg.use_steer_feature)
     # The reservoir persists next to whatever BC_OUT the run writes its actor
     # to, matching run_bc_monitored.py's own <out_dir>/bc_reservoir.pt.
     if BC_OUT:
@@ -650,13 +680,13 @@ def main():
 
         if NUM_ENVS == 1:
             cc, pc = channels[0]
-            trainer = Trainer(envs[0], cc, pc, cfg, encoder, pool, behavior_name, image_names = image_names)
+            trainer = Trainer(envs[0], cc, pc, cfg, encoder, pool, behavior_name, image_names = image_names, formations_dir = FORMATIONS_DIR)
         else:
             workers = []
             for i in range(NUM_ENVS):
                 cc, pc = channels[i]
                 workers.append(EnvWorker(envs[i], cc, pc, behavior_name))
-            trainer = Trainer.from_workers(workers, cfg, encoder, pool, image_names = image_names)
+            trainer = Trainer.from_workers(workers, cfg, encoder, pool, image_names = image_names, formations_dir = FORMATIONS_DIR)
             print("running %d parallel Unity instances" % NUM_ENVS)
 
         run_dir = os.path.join(LOGDIR, time.strftime("run_%Y%m%d_%H%M%S"))

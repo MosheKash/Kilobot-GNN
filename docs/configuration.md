@@ -119,6 +119,7 @@ The actor defaults to the DeepSet aggregator. Set `KILOBOT_ACTOR=gru` to use the
 | `KILOBOT_SPLIT_UPSCALE_HIDDEN` | `split_upscale_hidden` | 40 | Width of the split-observation actor's Tc/odometry upscale MLP. Ignored otherwise. |
 | `KILOBOT_SPLIT_GRU_HIDDEN` | `split_gru_hidden` | 59 | Hidden size of the split-observation actor's GRU. Ignored otherwise. |
 | `KILOBOT_SPLIT_HEAD_HIDDEN` | `split_head_hidden` | 40 | Hidden size of the split-observation actor's policy head. Ignored otherwise. |
+| `KILOBOT_SPLIT_ACTIVATION` | `split_activation` | `relu` | Hidden activation at `up1` and `head1` of the split-observation actor: `relu`, `elu`, `silu`, `leaky_relu` or `tanh`. Holds no parameters, so it changes no checkpoint's shape -- but a checkpoint trained under one value and evaluated under another is a different function, so set it to whatever the checkpoint's `meta["activation"]` says (`bc_offline.py` records it; `tools/eval_closed_loop.py` reads it automatically). `relu` is the historical value and is what died in phase 154. |
 | `KILOBOT_SPLIT_PROP_SCALE` | `split_prop_scale` | 0.04 | Scale on the split-observation actor's distance-to-anchor channel, applied to both the neighbor-anchored and seed-anchored odometry trackers. Targets the p90 of measured anchor-tracker distance (~21-27 raw units at prop_max_speed=1.55, heartbeat_ticks=48, 50-100 bots, cluster layout) toward O(1); re-derive against the replica if prop_max_speed or the population/heartbeat regime changes materially (docs/tuning.md 2026-07-10 entry). |
 | `KILOBOT_SPLIT_PROP_TIME_SCALE` | `split_prop_time_scale` | 0.02 | Scale on the split-observation actor's elapsed-time-since-anchor channel, applied to both odometry trackers. Targets the p90 of measured anchor-tracker elapsed time (~44-80s at max_episode_steps=2048) toward O(1); depends on max_episode_steps, not on prop_max_speed. |
 | `KILOBOT_SPLIT_SEED_WEIGHT_BOOST` | `split_seed_weight_boost` | 1.0 | Multiplies the seed sighting's weight in the split-observation actor's event pool before sampling. 1.0 leaves the weighted, no-priority-between-kinds sampling exactly as specified; raise it to sample seed events more often if the seed event rate below turns out low. |
@@ -199,6 +200,49 @@ Both change the actor's architecture, so a checkpoint trained with one will not 
 | `KILOBOT_ACTOR_RECURRENT` | `1` | Ablation: `0` swaps the GRUCell for a parameter-matched feedforward stand-in, isolating recurrence from capacity. |
 
 `arrived_loss_weight`, `cold_start_injection_prob` and `turning_duplicate_factor` are `Config` fields with no environment-variable override; reach them through `run_bc_monitored.py`'s `--arrived-loss-weight`, `--cold-start-injection-prob` and `--turning-duplicate-factor`.
+
+## The oracle-form motor head
+
+`Config` fields with no environment-variable override, reached through
+`bc_offline.py`'s flags. All three change the **deployed** forward pass without
+changing any tensor's shape, so a checkpoint trained with them loads cleanly into
+an actor built without them and silently computes a different function -- which is
+why `bc_offline.save_actor` records them in `meta` and every loader reads them
+back. See [`tuning.md`](tuning.md) phase 160.
+
+| Field | Flag | Default | Meaning |
+|---|---|---|---|
+| `use_oracle_head` | `--oracle-head` | `False` | Build the motor command as a soft mixture over the oracle's own five commands, each in closed form from quantities the actor already observes, weighted by the state head's posterior. Costs **no parameters and no inputs** -- it reuses `head_state`, `head_wall` and `head_motor`. Requires `--state-head-weight` and `--wall-head-weight` above 0, since the mixture weights are those two heads. |
+| `oracle_residual` | `--oracle-residual` | `0.05` | Bound, in motor units, on the learned COMMON-mode correction to that mixture. Nonzero so the closed form is a prior rather than a cage. |
+| `oracle_residual_turn` | `--oracle-residual-turn` | `0.0` | The same residual's DIFFERENTIAL half. Zero, and measured to belong there: swept on a trained network the median `wall_following` steering error is 0.00850 at 0.003 and 0.00058 at 0, with the motor MSE unchanged. |
+
+Two more `bc_offline.py` flags exist for the same problem and are diagnostics rather than
+recommendations:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--steer-weight` | `0.0` | Extra loss on the wheel pair's DIFFERENTIAL, on top of the plain MSE. The unstructured way to make the loss see the steering channel; it helps (median error 0.0403 -> 0.0112) and does not come close to computing the command. |
+| `--select` | `balanced` | Which held-out number picks `actor_best.pt`. `balanced` is the per-state mean motor MSE every run before phase 160 used; `steer` and `turn_bias_wall_following` are the steering channel's rms and its persistent per-robot component. |
+
+## The closed-form arrival gate
+
+Deployment-side, with no training to redo. The learned arrived head is accurate
+on the tape's distribution (0.99 recall at the 0.95 threshold) but under-fires on
+the deployment localisation shift, and a robot the gate never turns off is an
+unfinished robot. These `Config` fields swap that head's decision for the
+oracle's own arrival rule -- `closed_form_arrived` in `kilobot_gnn.py`: filter
+distance to the robot's own assigned target below a radius, confidence past the
+localisation floor, target actually assigned -- computed in real time from the
+actor's observation. No tensor shape changes, so any checkpoint loads under
+them. Reached through `tools/eval_closed_loop.py`, never through the architecture
+flags, because they select the *deployed* decision only. See the report in
+`../results/hybrid_cloning/` for the closed-loop comparison.
+
+| Field | Flag | Default | Meaning |
+|---|---|---|---|
+| `use_closed_form_arrived` | `--closed-form-arrived` | `False` | Gate the actor's stop on the oracle's own rule computed from the actor's filter, instead of the learned arrived head. The rule's slots in the observation's property vector: `PROP_CONF_POS` (12), `PROP_SIN_T`/`PROP_COS_T` (19, 20), `PROP_DIST_T` (21). Terminal, like the oracle's arrived state. |
+| `closed_form_arrival_dist` | `--closed-form-dist` | `0.0` (uses `cfg.tau_v`, `0.05`) | Arrival radius in normalised units. The actor's own filter under-reports closeness (empirically `d_target` ~1.5&times; the true distance at arrival), so `tau_v` stops almost nobody and the swarm orbits; `0.08` is the value measured to park robots where the filter certifies arrival. |
+| `closed_form_hybrid` | `--closed-form-hybrid` | `False` | With `use_closed_form_arrived`, run the closed-form rule in OR with the learned head instead of replacing it: the head under-fires on low-confidence near robots, the closed form certifies only tight arrivals, and the two miss different robots, so the OR is a strict superset of either branch alone. The latch is terminal either way. |
 
 ## Run summary
 

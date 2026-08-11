@@ -20,7 +20,7 @@ import torch
 from belief import (belief_read, belief_conf, belief_track_anchor, ANCHOR_STATE_SIZE,
                     ARENA_HALF, LOCALIZED_CONF_THRESHOLD, SEED_LAYOUTS, HEADING_NOISE_SCALE,
                     _matched_generator)
-from kilobot_gnn import SEED_SIZE, WALL_SIZE, MESSAGE_SIZE, MOTOR_SIZE, NODE_FEATURES, priv_cols, SPLIT_SEED_OFFSET, SPLIT_WALL_OFFSET
+from kilobot_gnn import SEED_SIZE, WALL_SIZE, MESSAGE_SIZE, MOTOR_SIZE, NODE_FEATURES, priv_cols, SPLIT_SEED_OFFSET, SPLIT_WALL_OFFSET, closed_form_arrived
 from kinematics import dead_reckon, split_tick_motion, split_track_update, split_track_read
 import observation
 # re-exported: these used to be defined in this module and other modules still
@@ -466,31 +466,55 @@ def _write_claim_broadcast(action_row, worker, a, l, arrived):
         action_row[7] = 0.0
 
 
-def _arrived_head_gate(worker, policy, cfg, a, l, idx):
-    """Whether the actor's arrived head has switched this robot off.
+def _arrived_head_gate(worker, policy, cfg, a, l, idx, closed_form = None):
+    """Whether the actor's arrival rule has switched this robot off.
 
-    config.py's own use_arrived_head has the full rationale. Only ever applies
-    when motor_override == "none" -- during BC's own oracle-driven collection
-    simple_oracle.py already handles its own arrived-stop; this is specifically
-    for the actor's own, actually-deployed behavior.
+    config.py's own use_arrived_head has the full rationale for the learned
+    head. Only ever applies when motor_override == "none" -- during BC's own
+    oracle-driven collection simple_oracle.py already handles its own
+    arrived-stop; this is specifically for the actor's own, actually-deployed
+    behavior.
 
     arrived_release_threshold turns this into hysteresis rather than a plain
     re-test: a robot switches off above arrived_confidence_threshold and only
     switches back on once confidence falls below this strictly lower bar, so it
     cannot chatter on and off around a single threshold. release <= 0 keeps the
     original, permanent behaviour.
+
+    With cfg.use_closed_form_arrived the learned head is replaced by the
+    oracle's own arrival rule computed closed-form from this tick's prop
+    (closed_form_arrived, kilobot_gnn): filter distance to the robot's own
+    target below tau_v with conf past the localization floor. Like the oracle's
+    `arrived`, it is terminal -- once it fires the robot stays off for the
+    episode. closed_form is the batch of flags; None keeps the learned path.
+
+    With cfg.closed_form_hybrid the closed form runs in OR with the learned
+    head instead of replacing it: the two miss different robots, so either
+    stopping catches more of both. Terminal either way.
     """
-    if policy.actor.head_arrived is None or cfg.motor_override != "none":
+    if cfg.motor_override != "none":
         return False
     if not hasattr(worker, "arrived_switched_off"):
         worker.arrived_switched_off = {}
     already_off = worker.arrived_switched_off.get(a, {}).get(l, False)
-    p_arrived = torch.sigmoid(policy.actor._arrived_logit[idx]).item()
-    release = float(getattr(cfg, "arrived_release_threshold", 0.0))
-    if already_off:
-        still_off = True if release <= 0.0 else (p_arrived >= release)
+    if getattr(cfg, "use_closed_form_arrived", False):
+        if closed_form is None:
+            return False
+        if getattr(cfg, "closed_form_hybrid", False) and policy.actor.head_arrived is not None:
+            p_arrived = torch.sigmoid(policy.actor._arrived_logit[idx]).item()
+            fire = bool(closed_form[idx]) or bool(p_arrived > cfg.arrived_confidence_threshold)
+        else:
+            fire = bool(closed_form[idx])
+        still_off = already_off or fire
     else:
-        still_off = p_arrived > cfg.arrived_confidence_threshold
+        if policy.actor.head_arrived is None:
+            return False
+        p_arrived = torch.sigmoid(policy.actor._arrived_logit[idx]).item()
+        release = float(getattr(cfg, "arrived_release_threshold", 0.0))
+        if already_off:
+            still_off = True if release <= 0.0 else (p_arrived >= release)
+        else:
+            still_off = p_arrived > cfg.arrived_confidence_threshold
     worker.arrived_switched_off.setdefault(a, {})[l] = still_off
 
     # Purely visual, and off unless cfg.oracle_send_visual_state is set. Reuses
@@ -594,6 +618,15 @@ def act(buffer, policy, worker, decision_steps, cfg, rng, deterministic = False,
         h_prev, prop_b = gather_split_state(worker, arena_ids, locals_, seed_narrowed, wall_narrowed,
                                             cfg, rng, rows = rows, valid = valid, wall_seed_xy = wall_seed_xy_narrowed,
                                             arrived_claim = arrived_claim)
+        # The oracle's own terminal arrival condition, computed closed-form from
+        # this tick's filter read-out rather than fitted (kilobot_gnn.
+        # closed_form_arrived). One tensor for the whole batch; the gate latches
+        # per robot below. The radius defaults to cfg.tau_v but is tunable
+        # (cfg.closed_form_arrival_dist): the actor's own filter under-reports
+        # closeness, so tau_v alone stops almost nobody.
+        cf_dist = getattr(cfg, "closed_form_arrival_dist", 0.0) or cfg.tau_v
+        cf_arrived = (closed_form_arrived(prop_b, cf_dist)
+                      if getattr(cfg, "use_closed_form_arrived", False) else None)
         action, env_action, log_prob, h_new = policy.act_batch_split(
             tc_b, prop_b, h_prev, deterministic=deterministic)
     elif gru:
@@ -699,13 +732,12 @@ def act(buffer, policy, worker, decision_steps, cfg, rng, deterministic = False,
         # while its bc_target was still go_north's [1.0, 1.0].
         was_turning = bool(oracle_state == "turning")
         if split_obs_actor:
-            freeze_hidden = _arrived_head_gate(worker, policy, cfg, a, l, idx)
-            if not freeze_hidden:
-                # Skipped when freeze_hidden: keeps h_prev at whatever it was
-                # when the robot switched off, rather than letting the GRU keep
-                # evolving over a long run of near-identical arrived
-                # observations, which drives its recurrent state into a drift
-                # that does not self-correct.
+            stopped = _arrived_head_gate(worker, policy, cfg, a, l, idx, closed_form = cf_arrived)
+            # Skipped when stopped: keeps h_prev at whatever it was when the
+            # robot switched off, rather than letting the GRU keep evolving over
+            # a long run of near-identical arrived observations, which drives
+            # its recurrent state into a drift that does not self-correct.
+            if not stopped:
                 worker.hidden[a][l] = h_new[idx].detach().clone()
             # Zero, not executed_motor, once switched off -- the real,
             # sent motor is forced to zero further below (right before
@@ -715,7 +747,7 @@ def act(buffer, policy, worker, decision_steps, cfg, rng, deterministic = False,
             # tracker this robot moved when it genuinely, physically
             # didn't -- the same corruption this function's own, existing
             # comment already warns about for the motor_override case.
-            worker.last_motor[a][l] = (torch.zeros(2) if freeze_hidden
+            worker.last_motor[a][l] = (torch.zeros(2) if stopped
                                        else executed_motor[idx].detach().clone())
             worker.last_dec_step[a][l] = worker.step_count[a]
             is_seed_event = bool((tc_b[idx, SPLIT_SEED_OFFSET:] != 0).any())

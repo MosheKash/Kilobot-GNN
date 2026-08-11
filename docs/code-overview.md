@@ -32,8 +32,9 @@ that is a bug in the layout, not in the table.
 | `policy.py` | actor -> sampled actions; the tanh squash and its log-det |
 | `ppo.py` | the clipped-surrogate update |
 | `gae.py` | advantage estimation |
-| `bc.py` | behaviour cloning: both the gradient step and the training loop |
-| `bc_replay.py` | the per-oracle-state reservoir BC fits from |
+| `bc.py` | behaviour cloning, online: both the gradient step and the collect/fit loop |
+| `bc_offline.py` | behaviour cloning, offline: the same oracle data as recorded sequences, fit with truncated BPTT |
+| `bc_replay.py` | the per-oracle-state reservoir the online BC path fits from |
 | `graph_batch.py` | collate per-arena graphs into one critic forward pass |
 | **what the robot knows** | |
 | `observation.py` | worker observation -> actor input tensors |
@@ -44,7 +45,7 @@ that is a bug in the layout, not in the table.
 | `simple_oracle.py` | **the oracle**: a five-state machine, and the BC teacher |
 | `spatial_hash.py` | decentralised target assignment (pure math) |
 | `formations.py` | the target shapes |
-| `reward.py` | the reward function and `coverage` |
+| `reward.py` | the reward function and `coverage`. NB `coverage` measures distance to the NEAREST on-pixel, which is **not** the task metric — that is "stopped within X of its OWN assigned target", see `tools/settle_report.py` |
 | `images.py` / `encoder.py` | formation files -> tensors -> latents |
 | **talking to Unity** | |
 | `unity_env.py` | build a Unity-backed `EnvWorker` from explicit settings |
@@ -57,7 +58,7 @@ that is a bug in the layout, not in the table.
 | `val_probe.py` | the cold-start check |
 | `checkpoint.py` | save/load and actor export (atomic writes) |
 | `config.py` | every tunable, in one dataclass |
-| `python/tools/` | one-off scripts nothing imports |
+| `python/tools/` | one-off scripts nothing imports. NB `tools/steer_report.py` is the one that scores a clone in the teacher's own steering variable rather than in wheel-pair MSE — the two disagree by three orders of magnitude, see `tuning.md` phase 160 |
 
 Three things moved to make the names true:
 

@@ -87,6 +87,14 @@ class Config:
     split_prop_scale: float = 0.04
     split_prop_time_scale: float = 0.02
     split_seed_weight_boost: float = 1.0  # multiplies the seed's pool weight before sampling
+    # Hidden activation at up1 and head1 (kilobot_gnn.SPLIT_ACTIVATIONS).
+    # "relu" is what every checkpoint before 2026-08-06 was trained with, and
+    # what dies: phase 154 measured 13 of head1's 40 units stuck at exactly
+    # zero for every decision, with no gradient path back. Holds no parameters,
+    # so it changes no checkpoint's shape -- but a checkpoint trained under one
+    # value and run under another is a different function, which is why
+    # bc_offline.py records it in the checkpoint's meta.
+    split_activation: str = "relu"
     # False swaps the GRUCell for a parameter-matched feedforward stand-in
     # (kilobot_gnn.MemorylessAggregator, 17859 params against the GRU's 17877),
     # isolating recurrence from capacity. Ablation switch only.
@@ -310,6 +318,91 @@ class Config:
     # Worth pairing with bc_motor_skip_arrived, where the gate is the only thing
     # that stops a robot.
     arrived_release_threshold: float = 0.0
+    # Deploy the oracle's OWN arrival rule, computed closed-form from the
+    # actor's observation, instead of the learned arrived head gate. The learned
+    # head is accurate on the tape's distribution (0.99 recall at 0.95) but
+    # under-fires on the deployment localisation shift; this rule cannot drift.
+    # The oracle stops when its filter's distance to the robot's assigned target
+    # falls below cfg.tau_v (after it has localized, conf_pos >=
+    # LOCALIZED_CONF_THRESHOLD), and belief_read already emits exactly
+    # d_target + conf_pos, so the gate becomes the teacher's own decision on the
+    # actor's own filter -- terminal, like the oracle's. Off keeps the learned
+    # head path unchanged.
+    use_closed_form_arrived: bool = False
+    # The closed-form arrival radius, in normalized units, when
+    # use_closed_form_arrived is on. 0 (the default) means cfg.tau_v, the
+    # oracle's own rule -- but the actor's OWN filter is more conservative than
+    # the oracle's (it under-reports closeness; empirically d_target ~1.5x the
+    # true distance at arrival), so tau_v stops almost nobody and the robots
+    # orbit the point forever. Set a larger radius to park them where this
+    # filter actually certifies arrival.
+    closed_form_arrival_dist: float = 0.0
+    # With use_closed_form_arrived, run the closed-form rule in OR with the
+    # learned arrived head instead of replacing it: the two miss different
+    # robots (the head under-fires on low-confidence near robots; the closed
+    # form certifies only tight arrivals), so either stopping is strictly a
+    # superset of the two alone. The latch is terminal either way, like the
+    # oracle's arrived state.
+    closed_form_hybrid: bool = False
+    # Whether a switched-off robot's GRU hidden state stops advancing. True is
+    # the original behaviour (phase 142): with nothing having trained the
+    # network on the long arrived stretches, letting the recurrence run over
+    # thousands of near-identical observations drifted it somewhere it could not
+    # come back from. False is correct once training DOES cover those stretches
+    # -- bc_offline.py rolls each robot's whole episode, arrived included -- and
+    # is then strictly better, because a frozen hidden state is a recurrence the
+    # training never saw. The motor is forced to zero either way; this only
+    # decides whether the hidden state keeps updating while it is.
+    arrived_freeze_hidden: bool = True
+    # Build the auxiliary oracle-state head (kilobot_gnn). Training-only: no
+    # deployed code path reads it, so it changes no behaviour by itself -- it
+    # exists so behaviour cloning can supervise the recurrent representation
+    # with the teacher's own state, instead of leaving that latent to be
+    # inferred from motor commands alone. Must be set to match a checkpoint,
+    # like use_arrived_head, or load_state_dict rejects it.
+    use_state_head: bool = False
+    # Build the auxiliary last-wall head (kilobot_gnn). Training-only, like
+    # use_state_head, and for the same reason in a sharper form: which wall a
+    # robot is following is the latent that wall_following's command is a
+    # function of, and an unsupervised guess at it shows up as a constant
+    # steering bias rather than as noise.
+    use_wall_head: bool = False
+    # Build the motor command as a soft mixture over the ORACLE's own five
+    # commands, each computed in closed form from quantities the actor already
+    # observes, weighted by the state head's posterior (kilobot_gnn.
+    # oracle_form_motor). Adds no parameters -- it reuses head_state, head_wall
+    # and head_motor -- and adds no inputs, but it changes the deployed forward
+    # pass, so a checkpoint must be loaded with the same setting. Requires
+    # use_state_head and use_wall_head.
+    #
+    # The measurement that motivates it: the oracle's wheel pair is almost all
+    # common mode, and its differential -- the only channel that steers -- has a
+    # spread of 0.0093 during wall_following, 0.1% of the target variance there.
+    # A two-output head fitted by MSE reproduces the common mode and misses the
+    # differential by 0.0895 rms, R^2 = -109 on HELD-OUT ORACLE DATA, worsening
+    # monotonically across every run of phases 156-159 while the headline MSE
+    # improved. See docs/tuning.md phase 160.
+    use_oracle_head: bool = False
+    # Magnitude of the learned residual added to that mixture, in motor units.
+    # Nonzero so the closed form is a prior rather than a cage: `navigating` in
+    # particular is NOT exactly reproducible -- the teacher steers by its own
+    # private particle filter, and the observation reproduces its direction with
+    # median offset 0.75 degrees but 56 degrees of spread.
+    oracle_residual: float = 0.05
+    # The same residual's DIFFERENTIAL half. Zero, and measured to belong there:
+    # the closed form's steering is already exact wherever it CAN be exact, so a
+    # learned correction on that channel has no legitimate job and the fit spends
+    # it hedging, which lowers MSE and worsens the command. Swept on a trained
+    # network -- median wall_following steering error 0.00850 at 0.003, 0.00290
+    # at 0.001, 0.00058 at 0, with the motor MSE unchanged to three figures. The
+    # knob is kept because that sweep is the evidence, not because a nonzero
+    # value is useful; head_motor's second output is inert while it is 0.
+    oracle_residual_turn: float = 0.0
+    # Feed the motor head the wall-gated alignment with the wall tangent --
+    # sin/cos of (tangent - heading), mixed over the wall head's own posterior.
+    # Requires use_wall_head. Costs 4 parameters and changes the deployed
+    # forward pass, so a checkpoint must be loaded with the same setting.
+    use_steer_feature: bool = False
 
     # ─── turn anchor ─────────────────────────────────────────────────────────
     # A second heading anchor, (re-)established when the actor's wall reading is

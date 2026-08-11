@@ -36,6 +36,17 @@ cd "$(dirname "$0")/.."
 SEED_LAYOUT="${1:-corners}"
 NUM_ARENAS="${2:-1}"
 TIME_SCALE="${3:-1}"
+# Same foot-gun watch_actor.sh documents in detail: the player's ImageLibrary
+# resolves KILOBOT_FORMATIONS against its OWN Application.dataPath, not this
+# script's cwd, so a relative ../data/formations leaves the player's image list
+# empty -- the target-formation background image on the floor never appears.
+# Canonicalise so the player and python agree on the shapes being shown.
+FORMATION_DIR=../data/formations
+if command -v realpath >/dev/null 2>&1; then
+    FORMATION_DIR="$(realpath -m "$FORMATION_DIR")"
+elif [ -d "$FORMATION_DIR" ]; then
+    FORMATION_DIR="$(cd "$FORMATION_DIR" && pwd)"
+fi
 
 echo "watching simple_oracle.py on $NUM_ARENAS arena(s), seed_layout=$SEED_LAYOUT, time_scale=$TIME_SCALE, no training"
 if [ "$NUM_ARENAS" -gt 2 ]; then
@@ -52,4 +63,4 @@ env KILOBOT_MODE=watch_oracle KILOBOT_MOTOR_OVERRIDE=simple_oracle \
     KILOBOT_SHOW_RADIUS=true KILOBOT_LOG_FORMATIONS=true KILOBOT_ORACLE_SEND_VISUAL_STATE=true \
     KILOBOT_ACTOR=gru_split_observation KILOBOT_SEED_LAYOUT="$SEED_LAYOUT" KILOBOT_HEARTBEAT_TICKS=48 \
     KILOBOT_ORACLE_KNOWN_START_HEADING=true \
-    KILOBOT_FORMATIONS=../data/formations python launch.py
+    KILOBOT_FORMATIONS="$FORMATION_DIR" python launch.py

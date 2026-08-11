@@ -92,11 +92,18 @@ env KILOBOT_SMOKE=1 KILOBOT_DEVICE=cpu KILOBOT_NUM_ARENAS=9 \
     KILOBOT_FORMATIONS=../data/formations python launch.py
 ```
 
-**Behaviour cloning** against the oracle — the recommended starting point, since RL from scratch does not currently converge:
+**Behaviour cloning** against the oracle — the recommended starting point, since RL from scratch does not currently converge. Two paths exist; the offline one is the one under active work:
 
 ```
-./scripts/train_bc.sh ../results/bc_run 300
+./scripts/bc_offline_pipeline.sh ../results/bc_v2      # record tapes, fit, DAgger, evaluate, report
+./scripts/train_bc.sh ../results/bc_run 300            # the older online loop
 ```
+
+The offline path records the oracle's rollouts to disk **once** (`tools/record_tape.py`) and then fits the actor to them as per-robot *sequences* with truncated BPTT, so training costs no simulation and a run is reproducible from a tape file and a seed. It also runs DAgger rounds, which are not optional here.
+
+**The task metric is not coverage.** It is: per robot, did it *stop* and did it stop *within X units of the point it was assigned* — reported as a distribution over arenas, counting only arenas the driver finished (>= 95% stopped). `tools/settle_report.py` measures it; `reward.coverage` asks the weaker question "near any on-pixel" and has a 0.286 chance floor.
+
+Where it stands (`docs/tuning.md` phases 156-159, which end with a handover section): the clone reproduces the oracle's **decisions** — 97% of held-out decisions within 0.05 of the teacher's command — but not its **outcome**. On the task metric the oracle settles a median 40% of robots within 5 units and finishes 21 of 24 arenas; the best clone settles 2% and finishes none, because its robots never get near their targets (median closest approach 55 units against the oracle's 19). Held-out imitation error and task outcome are anti-correlated across runs, which is why the recommended next step is reward-based fine-tuning from the BC warm start rather than more cloning.
 
 **RL**, warm-started from that clone:
 

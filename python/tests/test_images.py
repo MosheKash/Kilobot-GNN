@@ -4,6 +4,7 @@ import torch
 import pytest
 
 from images import formation_paths, build_image_pool
+from trainer import _sorted_png_position
 
 
 def _fake_preprocess(path):
@@ -25,6 +26,34 @@ def test_formation_paths_respects_limit():
             open(os.path.join(d, name), "w").close()
         paths = formation_paths(d, pattern = ".png", limit = 2)
         assert len(paths) == 2
+
+
+def test_sorted_png_position_matches_unity_position_index():
+    # With a CONTIGUOUS %06d folder, sorted position == numeric name, which is
+    # what the old implementation (int(stem)) got right by accident.
+    with tempfile.TemporaryDirectory() as d:
+        for i in range(5):
+            open(os.path.join(d, "%06d.png" % i), "w").close()
+        assert _sorted_png_position(d, "000003.png") == 3
+
+
+def test_sorted_png_position_handles_non_contiguous_folder():
+    # The regressive case that broke watch_actor.sh: a subsampled folder whose
+    # numeric names are NOT their sorted position. val_formations is one such:
+    # position 54 there is not 000054.png. Python MUST send Unity the sorted
+    # position (what ImageLibrary.files[] indexes), never the numeric stem.
+    with tempfile.TemporaryDirectory() as d:
+        for name in ["000054.png", "000086.png", "004025.png", "000157.png"]:
+            open(os.path.join(d, name), "w").close()
+        assert _sorted_png_position(d, "000054.png") == 0
+        assert _sorted_png_position(d, "000157.png") == 2  # not 157
+        assert _sorted_png_position(d, "004025.png") == 3  # not 4025
+
+
+def test_sorted_png_position_missing_name_returns_negative():
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, "a.png"), "w").close()
+        assert _sorted_png_position(d, "missing.png") == -1
 
 
 def test_build_image_pool_default_device_is_whatever_preprocess_returns():

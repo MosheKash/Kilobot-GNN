@@ -9827,3 +9827,991 @@ more of the useful signal with continued training, but that is training with a
 third of the trunk permanently disabled from the start, not a temporary setback.
 Points toward a fresh restart being the more sound path once a fix is found, not
 a resume.
+
+## 2026-08-06 (phase 156): behaviour cloning rebuilt as offline sequence training on recorded tapes -- and two real, confirmed bugs found in the process: a 90-degree geometry mismatch that made `coverage` measure the wrong shape, and an arrived head whose rare false positives are absorbing
+
+Direct request: "train the architecture to emulate the oracle perfectly using the
+BC cloning run... it should be able to solve the image formation problem as
+effectively as the oracle (convergence time doesn't matter but overall
+convergence does)." Everything below was measured on real Unity players; nothing
+here is a simulator result.
+
+### Why the online BC loop was replaced rather than tuned
+
+`bc.py`'s loop collects a rollout and fits single decisions against the hidden
+state that was cached *during collection*. Two problems follow structurally, not
+from any hyperparameter:
+
+1. **The stored `h_prev` came from an older actor.** The fit teaches
+   (observation, someone else's hidden state) -> action, while deployment needs
+   (observation, its OWN hidden state) -> action. The two only agree once the
+   actor has stopped changing.
+2. **Nothing in the loss ever asks the GRU to carry anything.** Every sample is
+   one step, so no gradient flows through the recurrence, and the state that has
+   to survive many ticks -- which wall a robot is following, that it is in
+   `wall_following` at all -- is never trained for.
+
+The replacement (`bc_offline.py`) fits the *same oracle data* as ordered
+per-robot sequences from a cold start with truncated BPTT, over tapes recorded
+once by `tools/record_tape.py` (val_tape.py's format, float16, a few hundred MB
+for a few million decisions). An epoch is then pure GPU compute: 3.0M decisions,
+120 epochs, 20 minutes -- against roughly 75 seconds per iteration for the
+online loop, which spends half of every iteration simulating.
+
+Recorded once, against real players: a 3.04M-decision training tape (8000 ticks
+x 16 arenas, formations excluding the held-out 2000) and a 1.49M-decision
+validation tape (held-out formations, its own swarm RNG). Both are on disk, so
+every later experiment is reproducible from a file and a seed.
+
+### The fit itself
+
+Held-out, after 120 epochs (`run_r0`), scored the way `val_tape.replay_tape`
+scores -- roll the network through each recorded sequence from h = 0:
+
+| metric | value |
+|---|---|
+| balanced motor MSE (mean over states) | **0.00121** |
+| decisions within 0.05 of the oracle on both wheels | **97.2%** |
+| arrived head precision / recall @ 0.95 | **1.000 / 0.998** |
+| permanently-zero units in `head1` | **0 of 40** |
+
+Per state: `go_north` 0.0005, `turning` 0.0025, `wall_following` 0.0010,
+`navigating` 0.0009, `arrived` 0.0033. `turning` is the hardest throughout,
+which is consistent with it being 0.9% of decisions and the only state whose
+command (0.9, 0.15) is nowhere near any other's.
+
+**Phase 154's dying-ReLU collapse did not reproduce, with ReLU.** A controlled
+pair, identical seed and data, differing only in activation: `elu` 0.00121,
+`relu` 0.00116, and **zero dead units in both**. Phase 154 read the collapse as
+an activation problem; this says the activation was the mechanism but not the
+cause. The cause is the training signal it was given -- `arrived`, 50% of the
+data, has the exact target [0, 0], which `squash_action`'s tanh reaches only as
+its pre-activation goes to -infinity. Excluding those rows from the motor loss
+(or, as here, floor them at 0.02 with a small weight) removes the pressure, and
+the same ReLU that died before does not. `split_activation` is now a Config
+field regardless, since it costs nothing and the checkpoint records which one
+it was trained with.
+
+### Bug 1: `coverage` has been scoring the swarm against a shape rotated 90 degrees
+
+Found by measuring, not by reading: an oracle-driven evaluation ended with 99.4%
+of robots reporting `arrived` and ground-truth coverage at 0.2414 -- *below* the
+0.2767 the same swarm had at spawn. Robots' final positions were then compared
+against `formations.Formation.points` under all eight axis-aligned transforms:
+
+| transform of robot positions | mean py distance | correlation with Unity's own `dist` column |
+|---|---|---|
+| identity | 3.1 | -0.05 |
+| **90 degrees CW** | **19.9** | **0.998** |
+
+Unity's per-robot distance is the python geometry evaluated at rotated
+positions, to 0.7 units per robot across three arenas. Confirmed from the other
+direction too: relaunching the same evaluation with
+`KILOBOT_BAKE_ROTATION_STEPS=0` makes Unity's distance match the python one
+(correlation 0.999, mean difference 0.7 units) and breaks the rotated match.
+
+The cause is in the history: phase 31 added a 90-degree CCW rotation to
+`ImageLibrary.BakeImage`'s on-points, and phase 33 removed the matching one from
+`formations.Formation` -- and noted in passing that Formation was then back at
+"BakeImage's own pre-phase-31 state", without reconciling the two. `simple_oracle`
+steers by `Formation` (through `observation.ensure_target`); the reward, the
+critic's `dist` column and `coverage` read `BakeImage`. They have disagreed by
+90 degrees ever since.
+
+**What that cost:** the oracle's real, ground-truth performance was invisible.
+Measured with the geometry aligned, the oracle takes coverage from 0.286 at
+spawn to **0.6213** and mean distance-to-shape from 0.120 to 0.0898. Measured in
+the rotated frame -- which is what every `coverage`-based number in this project
+has used -- the same run reads 0.2414 and 0.2368, i.e. indistinguishable from
+not having moved. Every evaluation here therefore runs with
+`--bake-rotation-steps 0`, and `tools/bc_report.py` independently recomputes
+coverage python-side from stored positions as a cross-check.
+
+This is a measurement fix, not a training change: BC never reads `dist`, and the
+oracle never read `BakeImage`. It does mean any coverage- or reward-based
+conclusion drawn since phase 31 is suspect.
+
+### Bug 2: the arrived head's false positives are absorbing, and one-step accuracy hides it
+
+The round-0 actor matches the oracle on 97.2% of held-out decisions and its
+arrived head has precision 1.000 there. Driven closed-loop it stops 72% of the
+swarm within 2800 ticks, in the wrong places, and ends at 0.289 coverage against
+the oracle's 0.621.
+
+The mechanism is not that the head is bad; it is that a mistake cannot be
+undone. `actor_io._arrived_head_gate` latches: once a robot switches off, its
+motor is forced to zero, so its observations stop changing and it never switches
+back. A per-decision false-positive rate that looks negligible is not, because a
+robot makes hundreds of decisions and only needs one.
+
+Measured directly, same checkpoint, two distributions:
+
+| tape | arrived FP rate per decision | balanced motor MSE |
+|---|---|---|
+| oracle-driven (held out) | 0.0004% | 0.0012 |
+| the actor's OWN trajectories | 59.5% | 0.4606 |
+
+380x worse on the states its own mistakes produce. Raising the threshold from
+0.95 to 0.999 moved the FP rate from 24.4% to 22.3% on a comparable probe: the
+head is confidently wrong, not marginally wrong.
+
+Two responses, both applied:
+
+- **DAgger.** `tools/record_tape.py --driver actor` runs a checkpoint
+  closed-loop while `simple_oracle` rides along as a pure observer and labels
+  every decision with what it would have commanded. This is legitimate here for
+  a specific reason: the oracle's decision is a function of its own particle
+  filter, its own dead-reckoned heading, and the robot's real wall readings, all
+  of which it maintains itself from the motors actually executed, whoever issued
+  them. A round is recorded, appended to the training tapes, and refit.
+  `--oracle-warmup-ticks` hands over mid-episode, because otherwise a round only
+  ever sees the first phase the actor fails in -- robots that stall against a
+  wall never reach `navigating`, so no number of rounds produces on-policy data
+  for the later states.
+- **`arrived_freeze_hidden`, new Config field, default unchanged.** Freezing the
+  GRU's hidden state while a robot is switched off (phase 142) is right when
+  nothing ever trained the network on those long arrived stretches, and wrong
+  now that `bc_offline.py` rolls whole episodes including them: a frozen
+  recurrence at deployment is one the training never saw. Evaluations here run
+  with it off, and with `--arrived-release-threshold 0.5`, so a wrong stop is
+  recoverable rather than terminal.
+
+### DAgger, four rounds: what it fixed and what it did not
+
+Each round records the actor driving (with an oracle warm-up from round 3 on),
+appends the tape, and refits from scratch on everything. `tools/tape_eval.py`
+prints the whole matrix; the diagonal is what each round was trained to fix,
+and the entries to its right are the states it had not seen yet. Balanced motor
+MSE, lower is better:
+
+| checkpoint | val (oracle) | dagger_1 (r0's states) | dagger_2 (r1's) | dagger_3a (r2's) | dagger_4 (r3's) |
+|---|---|---|---|---|---|
+| round 0 | **0.0012** | 0.4606 | 0.2406 | 0.1035 | 0.0429 |
+| round 1 | 0.0037 | **0.0004** | 0.1371 | 0.0530 | 0.0449 |
+| round 2 | 0.0049 | 0.0022 | **0.0015** | 0.0862 | 0.1051 |
+| round 3 | 0.0056 | 0.0032 | 0.0010 | **0.0059** | 0.0364 |
+| round 4 | 0.0081 | 0.0031 | 0.0007 | 0.0069 | **0.0080** |
+
+The mechanism works exactly as advertised: every round drives the previous
+round's on-policy error down by one to two orders of magnitude, and the
+arrived head's on-policy false-positive rate goes 59.5% -> 8.7% -> 0.7% -> 0.0%
+across the same sequence. It also costs a fixed price in the oracle's own
+distribution (0.0012 -> 0.0081), which is the expected trade and not a
+regression.
+
+**And it is still not enough to reproduce the task.** Closed loop on held-out
+formations, every run measured identically (8 arenas, 10000 ticks, aligned
+geometry, `--arrived-release-threshold 0.5`):
+
+| driver | robots on the shape, final | mean distance | robots stopped |
+|---|---|---|---|
+| oracle | **0.638** | 0.077 | 0.988 |
+| round 0 (no DAgger) | 0.289 | 0.186 | 0.995 |
+| round 1 | 0.189 | 0.288 | 0.493 |
+| round 3 | 0.151 | 0.296 | 0.019 |
+| round 4 | 0.117 | 0.313 | 0.000 |
+| round 4, without the degenerate round-3b tape | 0.092 | 0.310 | 0.000 |
+| round 5, `--obs-noise 0.03` | 0.153 | 0.295 | 0.002 |
+| round 6, + auxiliary state head | 0.104 | 0.307 | 0.003 |
+| round 7, + the round-5 DAgger tape | 0.124 | 0.315 | 0.003 |
+| round 8, + auxiliary wall head | 0.149 | 0.297 | 0.020 |
+
+Read that column against where it starts, not against zero: the swarm spawns at
+**0.286** coverage, because a robot dropped at random in an arena whose target is
+a QuickDraw stroke is already within `tau_v` of it about a third of the time. So
+no round is above chance, and round 0's 0.289 is not a partial success -- it is
+the spawn distribution, frozen in place by the arrived-gate bug. The oracle is
+the only driver that moves the number, and it more than doubles it.
+
+The failure moved rather than disappearing. Round 0 stopped its swarm in the
+wrong places; rounds 3-4 no longer stop wrongly at all (1.9% stopped), and
+instead never finish: the robots reach the walls and stay there. Measured from
+the stored positions of arena 0, mean gap to the nearest wall over the run --
+the oracle goes out to the wall and comes back (45 -> 19 -> 45 units) while the
+actor goes out and stays (45 -> 13 -> 14), with a third of the oracle's net
+displacement per 200 ticks.
+
+The mechanism is localization, and it is measurable directly in the tapes:
+`belief_read`'s own conf_pos crosses `LOCALIZED_CONF_THRESHOLD` for **63.4%** of
+robots along the oracle's trajectories and **18.2%** along an early actor's.
+`wall_following` exits into `navigating` on that threshold and nothing else, so
+a robot that never localizes never navigates, never arrives, and the shape never
+forms. Replaying round 3 against its own trajectories shows where the fidelity
+goes: `go_north` and `turning` are matched to 0.04-0.05 per wheel, but
+`wall_following` and `navigating` are off by 0.12 -- and the oracle's own
+command in those states varies by only ±0.03, so an 0.12 error is not a small
+perturbation of the right behaviour, it is a different behaviour.
+
+**Two things this is NOT.** Both were tested rather than assumed:
+
+- *Not the parameter budget.* A deliberately oversized actor (gru 128, head 96,
+  upscale 80 -- 2.7x the widths the 24KB budget allows) trained on the identical
+  data reached 0.0061 held-out against the budgeted model's 0.0059. The
+  architecture is not what the fit is running into.
+- *Not a broken heading input.* The actor steers off `belief_read`'s heading
+  while the oracle steers off its own separately-tracked scalar, so a drifting
+  filter heading would have explained everything. Measured on the training tape,
+  over every robot's whole `go_north` run (where the true heading is constant by
+  construction): maximum drift 0.0000 radians. The input is exact.
+
+### Where this leaves the goal
+
+**The stated goal -- "solve the image formation problem as effectively as the
+oracle" -- is not met.** The actor imitates the oracle's decisions to 97% agreement on held-out data and
+its arrived head is essentially perfect there; it does not yet reproduce the
+oracle's task performance closed-loop, and the residual is a compounding
+steering error in the two long states, not a stopping bug, not capacity, and not
+a broken observation. The pipeline to continue is one command
+(`./scripts/bc_offline_pipeline.sh ../results/bc_v2 dagger eval report` with
+`DAGGER_ROUNDS` raised), and the two things worth trying next, in order:
+
+1. **More rounds, recorded with a warm-up.** Rounds 3 and 4 are the first two to
+   contain any on-policy `wall_following`/`navigating` at all, and the last row
+   of the matrix above is the first that is uniformly small. The distribution is
+   still moving; the loop has not converged, it has been run four times.
+2. **Noise-augmented fitting** (`--obs-noise`, added this phase). A cloned
+   policy is brittle exactly off the expert's trajectory, and widening the
+   neighbourhood it is correct in costs no collection at all. Run at sigma 0.03
+   it gives the best held-out imitation error of anything here (**0.00507**) and
+   the best closed loop of any DAgger round (0.153 against round 4's 0.117) --
+   real, in the right direction, and nowhere near enough on its own. Worth
+   sweeping sigma rather than concluding from one value.
+
+A third possibility deserves stating plainly, because four rounds of DAgger not
+closing the gap is evidence for it: the oracle may be a poor thing to clone at
+this horizon. Its behaviour is a state machine whose transitions hinge on
+threshold crossings (`belief_conf >= 0.4`, `turn_accum >= pi/2`) that a
+regression on motor values reproduces only approximately, and approximately is
+not enough when the consequence of missing one is that a robot spends the rest
+of a 10000-tick episode in the wrong state. The BC objective -- match the
+command -- is not the objective that matters -- reach the same state. Reaching
+for RL from this warm start (which is what the warm start was always for), or
+for a loss that scores state agreement rather than command agreement, are both
+more promising than a fifth round.
+
+### The control that identifies what is actually missing
+
+A clone that reproduces its teacher's command to within *e* per wheel is,
+dynamically, the teacher driving with *e* of noise. So drive the teacher with
+that noise and see what happens. `tools/eval_closed_loop.py --mode oracle
+--motor-noise 0.12` perturbs the oracle's own command by exactly the per-wheel
+error the round-3 actor makes along its own trajectories (measured above:
+`wall_following` and `navigating` both 0.12), leaving everything else identical
+-- the same held-out formations, the same spawns, the oracle's own belief and
+heading dead-reckoning from the perturbed motion, as a noisy real controller
+would.
+
+| driver | robots on the shape, final | mean distance |
+|---|---|---|
+| oracle | 0.638 | 0.077 |
+| **oracle, every command perturbed by sigma 0.12** | **0.463** | 0.093 |
+| the actor whose error that sigma was taken from | 0.151 | 0.296 |
+
+The oracle degrades gracefully -- it loses a quarter of its coverage and still
+solves the task for most of the swarm. The clone, at the same per-command error,
+loses everything. **The clone's error is therefore not the size of its error.**
+Random error of that magnitude is survivable; the clone's error is structured --
+it is in the wrong *mode*, and stays there, which no amount of per-command
+precision fixes and which the DAgger matrix above (small errors on every
+recorded distribution, still failing on the new one) is the same fact seen from
+the other side.
+
+That reframes the remaining work. Cloning a five-state machine by regressing its
+motor output leaves the state itself an unsupervised latent, and the two states
+that matter (`wall_following`, `navigating`) are separated by a threshold
+crossing (`belief_conf >= 0.4`), not by anything visible in the command. An
+auxiliary head predicting the teacher's state directly -- added this phase,
+`--state-head-weight`, training-only and 205 parameters -- gives the best
+held-out imitation error of anything here (**0.00392**) and does not move the
+closed loop, which says supervising the representation is not by itself enough
+either: the state has to be right *at deployment*, not merely predictable.
+
+Worth trying next, in the order I would try them:
+
+1. **Use the state head at deployment rather than only in training** -- gate or
+   bias the motor output on the predicted state, so a mode error is a discrete
+   thing the network commits to and can be corrected, rather than a smooth blend
+   of two behaviours that is neither.
+2. **RL from this warm start**, which is what the warm start was always for. The
+   clone reaches the walls reliably and stops appropriately; what it cannot do
+   is the credit assignment across a threshold crossing thousands of ticks
+   later, and that is exactly what a return, rather than a per-decision label,
+   is for.
+
+### The structure of the error, found and fixed -- and still not enough
+
+If the clone's error is structured rather than noisy, the next question is what
+the structure IS. Measured by replaying the round-5 actor over its own recorded
+trajectories and separating the motor command into speed and *differential*
+(left minus right, which is the whole steering signal):
+
+| oracle state | oracle's own \|turn\| | clone's MEAN SIGNED turn error | clone's mean \|error\| |
+|---|---|---|---|
+| go_north | 0.0000 | -0.0003 | 0.0024 |
+| turning | 0.7499 | -0.0335 | 0.0641 |
+| **wall_following** | **0.0015** | **+0.1078** | 0.1142 |
+| navigating | 0.1522 | +0.0710 | 0.1819 |
+
+During `wall_following` the teacher drives essentially straight (mean turn
+magnitude 0.0015) and the clone applies a **constant one-way turn of +0.108**.
+That is not an approximation of driving straight; it is driving in a circle,
+which is exactly what the stored positions show -- the swarm reaches the wall
+and orbits there, at a third of the oracle's net displacement, never reaching a
+corner, never localizing.
+
+Where a constant turn comes from is then obvious: `wall_following`'s command is
+`_steer(heading, WALL_TANGENT[wall_name])`, and `wall_name` differs by 90
+degrees between walls. A network unsure which wall it is on cannot hedge on a
+steering command without turning. The wall identity is observable only at the
+moment of contact and has to be carried for thousands of ticks after.
+
+So supervise it. `--wall-head-weight` adds a training-only 4-way head over which
+wall was last touched, and the label needs no new recording at all: it is the
+last nonzero wall slot in the tape's own Tc, forward-filled, which is precisely
+what `simple_oracle` latches at the `go_north -> turning` transition. 164
+parameters, no deployed path reads it.
+
+**It works, on exactly the thing it was aimed at.** Same replay, same tape, with
+both auxiliary heads on:
+
+| oracle state | mean signed turn error, round 5 | with state + wall heads |
+|---|---|---|
+| wall_following | +0.1078 | **+0.0052** |
+| navigating | +0.0710 | **+0.0008** |
+
+A 20x reduction in the bias, and what is left is symmetric -- which the noisy-
+oracle control says is the survivable kind. **And the closed loop did not
+move**: coverage plateaus at 0.14 exactly as before, while the oracle at the
+same tick is at 0.38 and climbing.
+
+That is worth stating precisely, because it is the most informative negative
+result here: the bias was real, the diagnosis was right, the fix removed it on
+held-out trajectories, and the swarm still does not assemble. Whatever remains
+is not this bias, not the arrived gate, not the parameter budget, not the
+activation, not the heading input, and not the amount of on-policy data (five
+rounds). Each of those was measured, not argued.
+
+## 2026-08-06 (phase 157): the DAgger labels were wrong -- a one-line ordering bug in the shadow oracle, and the retraction of everything phase 156 concluded from them
+
+**Found by chasing a contradiction rather than by reading code.** Phase 156's
+round-8 clone had, on its own trajectories, a 99.8% accurate oracle-state head, a
+100% accurate wall-identity head, and commanded speeds within 0.003 of the
+teacher's in every state -- and its swarm still crawled at a sixth of the
+oracle's rate. Those cannot all be true. Probing its own rollout showed the
+shadow oracle reporting **68.7% of all decisions in `turning`**, over 1500 ticks,
+which no correct run of a state machine whose turn takes ~35 decisions can
+produce.
+
+**The bug.** `simple_oracle_motors` derives this tick's motion from
+`step_count - last_dec_step[a][l]`, and `actor_io.act` sets `last_dec_step =
+step_count` for every robot it commands. `tools/record_tape.py`'s DAgger
+labeller called the oracle *after* `act()` returned. So the oracle saw
+`steps_since == 0` for every robot on every tick: it dead-reckoned zero motion,
+never advanced its particle filter, and never accumulated any rotation. Its turn
+could not complete, its belief could not converge, and every label it produced
+after the first tick was computed from a frozen pose. `act()`'s own bc_capture
+path calls the oracle *before* the same update, which is why oracle-driven tapes
+were never affected.
+
+Same checkpoint, same spawn, same 1500 ticks, labels only:
+
+| shadow oracle reports | go_north | turning | wall_following | navigating |
+|---|---|---|---|---|
+| oracle called after `act()` | 22292 | **48922** | 0 | 0 |
+| oracle called before `act()` | 19909 | 3097 | **39649** | **4443** |
+
+**`run_bc_monitored.py` has the identical bug** in its own `shadow_act`, which
+means the `actor_state_pct` panel and the `arrived_agreement` census in every
+monitored BC run ever done here have been reading a frozen shadow: the actor's
+population can only ever appear as go_north/turning, and `shadow_says_arrived` is
+permanently false, so every arrived call the actor makes is counted `actor_only`
+by construction. Fixed in both files.
+
+### What phase 156 got wrong because of this
+
+- **"The clone cannot complete its turn."** Retracted. It completes turns fine;
+  the shadow's turn was the thing that never completed.
+- **The DAgger matrix, and every conclusion drawn from it.** Rounds 1-8 were
+  trained on steering commands computed from a frozen belief. The monotonic
+  closed-loop decline across those rounds (0.289 -> 0.189 -> 0.151 -> 0.117) is
+  most simply read as the corruption accumulating, not as DAgger failing.
+- **"The wall head removed the bias and it did not help."** The bias was measured
+  against corrupt targets on both sides of the comparison. Unmeasured.
+- **The +0.108 constant steering bias in wall_following.** Measured against
+  corrupt labels. The corrected measurement on the round-0 clone's own
+  correctly-labelled rollout is a *turn* bias near zero in wall_following
+  (-0.002) with a large symmetric error (0.287), and the dominant defect is
+  somewhere else entirely (below).
+- **"Latent state drift over long horizons."** Independently refuted before the
+  bug was found: 99.8% state accuracy and 100% wall accuracy on-policy. The
+  network carries what it needs.
+
+### What survives, re-measured against correct labels
+
+The covariate shift is real and was only modestly exaggerated. Round-0 clone:
+
+| tape | balanced motor MSE | within 0.05 | arrived FP per decision |
+|---|---|---|---|
+| oracle-driven (held out) | 0.0012 | 97.2% | 0.013% |
+| its own rollout, corrupt labels | 0.4606 | 12.5% | 59.5% |
+| its own rollout, **correct labels** | **0.2472** | 14.6% | **55.7%** |
+
+And the corrected error profile names the actual defect, which is not steering:
+
+| state (round-0 clone, own rollout) | turn bias | \|turn error\| | **speed bias** |
+|---|---|---|---|
+| **go_north** | +0.096 | 0.098 | **-0.711** |
+| turning | -0.102 | 0.116 | +0.059 |
+| wall_following | -0.002 | 0.287 | -0.227 |
+| navigating | +0.042 | 0.280 | -0.039 |
+
+In `go_north` the teacher commands `[1, 1]` and the clone drives at **0.29 of
+that**. It is not steering wrong; it is barely moving, because it believes it has
+arrived -- the same defect the 55.7% arrived false-positive rate names, showing
+up in the motor head as well as in the gate. That matches the closed loop
+exactly: round 0 stopped 99.5% of its swarm with coverage pinned at the spawn
+value.
+
+### Also corrected: `watch_oracle.sh` is fine
+
+Phase 156 claimed the watch path showed a different drawing than the swarm was
+assembling, because `--limit 1` makes python's pool a random sample while Unity
+indexes its own full sorted listing. That is wrong: `Trainer._absolute_image_index`
+already recovers Unity's index from the `%06d.png` filename, and `launch.py`
+passes `image_names` on both the eval and watch paths. Watching shows the real
+target. `tools/record_tape.py` was the one that did *not* pass `image_names`,
+which affected only the player's floor and `dist` column and never a tape; fixed.
+
+The visual report that the oracle puts every robot on the shape is therefore a
+valid observation, and it agrees with the measurement: in a single-shape run with
+the geometry aligned, arena 0/0 placed **100% of its robots within 10 units** of
+the target, worst robot 5.5 units. The oracle's average of 0.638 across arenas is
+the average of near-perfect arenas and arenas where a minority of robots localize
+confidently to a wrong pose and stop tens of units away -- 13 of 43 in one case,
+not at a wall, not at a symmetry alias of the shape.
+
+## 2026-08-06 (phase 158): what actually caps the clone -- the teacher's own trajectories are degenerate in the one variable its command depends on
+
+With the labelling bug of phase 157 fixed, the clean DAgger loop works and its
+limit becomes measurable. Round 1 removed the defect it could remove: the
+round-0 clone drove at 0.29 of commanded speed during `go_north` because it
+believed it had arrived (speed bias **-0.711**), and one clean round took that
+to **-0.014**, which is why round 9 stopped freezing at spawn and started
+running the whole state machine. Round 2, with the corrected wall label below,
+improved every steering state again (`wall` 0.286 -> 0.254, `navi` 0.281 ->
+0.237, `turn` 0.142 -> 0.092). Closed loop: 0.182 then 0.226, against the
+oracle's 0.638 and a spawn baseline of 0.286.
+
+### The wall label was the wrong latent
+
+`simple_oracle` latches `simple_wall_name` once, at the `go_north -> turning`
+transition (line 344), and steers by it forever. The auxiliary head added in
+phase 156 was trained on the *most recently observed* wall instead, which
+disagrees with the latched one on **25% of oracle-driven decisions** and 63% of
+the clone's own -- so it was teaching the wrong thing.
+
+The latched wall is recoverable offline with no new recording, because the
+command reveals it: in wall_following the oracle emits `-0.7 * s * sin(tangent -
+heading)`, and the heading is in `prop`. Inverting gives an implied tangent that
+lands within 5 degrees of a cardinal axis for **100%** of oracle-driven
+decisions and 90% of the clone's, and which cardinal it is IS the latched wall.
+It is constant per robot-episode, so one vote labels every decision that robot
+makes (`bc_offline.wall_labels_from_targets`). With that label the head reaches
+99.8% accuracy on the clone's own rollouts.
+
+### But the wall was not the residual either
+
+Same measurement, same tape, round 10: wall-head accuracy in wall_following
+**99.8%**, and the steering error *when the wall is right* is **0.2522**. Nor is
+it the discontinuous reacquire branch (2.3% of decisions). What it is:
+
+| misalignment from the steering direction | oracle's own trajectories | clone's |
+|---|---|---|
+| 0-5 deg | **99.9%** | 34.4% |
+| 5-10 deg | 0.1% | 33.1% |
+| 10-20 deg | 0.0% | 20.9% |
+| 20-40 deg | 0.0% | 10.0% |
+| 40+ deg | 0.0% | 1.6% |
+
+The oracle is a *stabilising* controller. It holds itself within five degrees of
+the direction it is steering toward essentially always, so its demonstrations
+are a thin shell around a stable manifold -- and the clone, which does not start
+on that manifold, spends two thirds of its time off it. The clone's error tracks
+the misalignment directly: 0.098 at 0-5 degrees, 0.237 at 40-90.
+
+### Three things that are NOT the cause, each measured
+
+- **Not capacity.** A 6.5x actor (gru 160 / head 128 / upscale 96, 157KB against
+  the budgeted 24KB) trained on identical clean data reaches the same held-out
+  score (0.0053 against 0.0052) and the same error in every misalignment bin.
+  Third independent capacity null in two phases.
+- **Not missing information.** Reconstructing the oracle's wall_following
+  command analytically from *only what the actor observes* -- belief heading,
+  latched wall, conf_pos, through the oracle's own formula -- gives mean error
+  **0.0000** on oracle-driven data and **0.0346** on the clone's own rollout.
+  So ~0.035 is achievable and trained networks sit at 0.15-0.25. They are
+  underfitting a function they have the inputs and the capacity for.
+- **Not expert-noise coverage (DART), at least not usefully.** Recording the
+  oracle with its executed motor perturbed while labelling with its clean
+  command (`tools/record_tape.py --motor-noise`, verified survivable first: the
+  oracle still reaches 0.463 coverage at sigma 0.12) widens the shell far less
+  than expected, because the teacher corrects back within a decision or two:
+
+  | tape | 0-5 deg | 5-10 | 10-20 | 20-40 |
+  |---|---|---|---|---|
+  | clean oracle | 99.9% | 0.1% | 0.0% | 0.0% |
+  | + noise 0.08 | 97.2% | 2.1% | 0.7% | 0.0% |
+  | + noise 0.18 | 88.5% | 10.4% | 1.1% | 0.0% |
+  | the clone's own rollout | 34.4% | 33.1% | 20.9% | 10.0% |
+
+  A DAgger round samples that regime an order of magnitude better than noise
+  injection does. Worth knowing before reaching for DART on a stabilising
+  expert.
+
+### What that leaves, and the change it motivates
+
+The gap is one specific operation. `-0.7 * s * sin(tangent - heading)` requires
+*selecting* among `+-sin(heading)`, `+-cos(heading)` according to a discrete
+latent the network has to remember -- a product of a memorised category with a
+continuous input. All four candidates are already linear functions of the
+observation, so what is missing is not a feature but the multiplication. A
+network can represent it; measured, it does not learn it, and neither more
+parameters nor more of the same data changes that.
+
+So compute it instead: `use_steer_feature` (kilobot_gnn.split_motor_from_head)
+mixes the four candidate alignments by the wall head's own softmax and hands the
+resulting sine and cosine to the motor head. Four extra parameters, no new
+sensing -- it is built entirely from the belief heading the actor already has
+and the wall it already predicts at 99.8%. Soft rather than argmax so the
+gradient reaches the wall head. Factored into one function shared by
+`split_forward_batch` and `bc_offline.forward_chunk`, since a second copy of the
+forward pass is exactly how a training path and a deployed path drift apart.
+
+## 2026-08-07 (phase 159): the objective was wrong -- it is "stopped near its OWN assigned point", not coverage -- and what that changes
+
+Direct correction from the user, after a day spent optimising the wrong thing:
+"I am *not* trying to optimize for coverage. The main thing that I want to
+optimize is how many robots stop within a certain distance of their target
+point." Everything phases 156-158 reported as the headline number measured
+`reward.coverage`, which asks whether a robot is near ANY on-pixel of the
+drawing -- a robot parked on somebody else's part of the shape satisfies it, and
+a swarm dropped at random already scores 0.286.
+
+The right metric is per-robot and stricter: **stopped, AND within X units of the
+point `observation.ensure_target` assigned to it**. It is measured by
+`tools/eval_closed_loop.py` (which now records each robot's assigned target from
+`worker.simple_target` and its own stopped flag) and reported by
+`tools/settle_report.py`, which shows the DISTRIBUTION over arenas rather than a
+mean over robots -- because the mean hides the only interesting structure.
+
+### The oracle's real number, over 24 arenas
+
+Per the user's rule, an arena only counts if the oracle has actually finished it
+(>= 95% of its robots stopped). 21 of 24 qualified; the three dropped were at
+91%, 94% and 95%.
+
+| bar | within 5u | within 10u | within 20u |
+|---|---|---|---|
+| arenas settling at least 50% of robots | 29% | 43% | 71% |
+| arenas settling at least 80% | 10% | 19% | 24% |
+| arenas settling at least 90% | **0%** | 19% | 19% |
+| the median arena | 40% | 44% | 62% |
+
+So the oracle is very good in a minority of arenas -- the best reaches 83% within
+5u, and single-arena watching lands there often, which is why it looks flawless
+on screen -- and the *median* arena settles 40% of its robots within 5 units. **No
+arena of 24 settles 90% within 5u.**
+
+The per-robot error distribution is unmistakably **bimodal**: a spike inside 5
+units, a gap, then a flat tail out to the 120-unit clip. A robot either lands on
+its point or ends up somewhere unrelated. That is a localization outcome, not
+graded imprecision, and it is the same phenomenon phase 150 recorded as
+belief-vs-ground-truth divergence.
+
+### The clone, same metric
+
+| | median arena within 5u | 10u | 20u | arenas >= 95% stopped |
+|---|---|---|---|---|
+| oracle | 40% | 44% | 62% | 21 of 24 |
+| round 10 (best clone) | 2% | 5% | 13% | **0 of 8** |
+
+By the user's own criterion the best clone completes **no** arena. It stops 8.4%
+of its swarm against the oracle's 99%.
+
+### It does not fail to stop. It fails to arrive.
+
+The obvious reading -- fix the arrived head -- is wrong, and measuring says so.
+The head has precision 1.000 and recall 0.99 on held-out oracle data; it fires on
+1.3% of the clone's own decisions because the condition is essentially never met:
+
+| | best belief-distance to own target each robot ever reaches |
+|---|---|
+| oracle-driven | median 0.192 (19 units) |
+| round 10's own rollout | median 0.554 (55 units) |
+
+The clone's robots never get near their targets, so there is nothing to stop for.
+Arrival is downstream of navigation, and navigation is downstream of
+localization.
+
+**A related subtlety worth knowing.** `simple_oracle`'s arrival test thresholds
+the distance of the belief MEAN to the target, while what the actor observes
+(`prop[21]`, `belief_read`'s `d_target`) is the mean over particles OF the
+distance. Those differ whenever the cloud is spread, so the quantity the oracle
+thresholds is not literally in the actor's observation -- it has to be inferred
+from `d_target` together with `conf`. In-distribution the network does that
+(recall 0.99); it is one more place where the teacher conditions on something
+private.
+
+### The proxy stopped predicting the objective
+
+Across the four correctly-labelled runs, held-out imitation error and closed-loop
+outcome are **anti-correlated**:
+
+| run | held-out balanced | coverage | note |
+|---|---|---|---|
+| round 11 | **0.00499** (best) | 0.172 (worst) | DAgger x3 |
+| round 10 | 0.00522 | **0.226** (best) | DAgger x2 |
+| round 12 | 0.00525 | 0.194 | everything + DART + steer feature |
+| round 13 | 0.00551 | 0.181 | steer feature |
+
+Every lever that improved the imitation metric left the task flat or worse. That
+is the strongest single argument in this whole arc for changing objective rather
+than continuing to tune the fit.
+
+### Controls that bound what precision is worth
+
+Driving the ORACLE with injected error, to ask how much command error the task
+tolerates and of what kind:
+
+| driver | coverage | mean dist | stopped |
+|---|---|---|---|
+| oracle, clean | 0.638 | 0.077 | 0.988 |
+| + i.i.d. noise sigma 0.12 | 0.463 | 0.093 | 0.978 |
+| + PERSISTENT per-robot bias sigma 0.10 | 0.414 | 0.136 | 0.403 |
+| + PERSISTENT bias sigma 0.20 | 0.366 | 0.143 | 0.223 |
+| round 10 (clone) | 0.226 | 0.232 | 0.119 |
+
+Two conclusions. A *correlated* error is far more damaging than an independent
+one of the same size (0.414 at 0.10 correlated vs 0.463 at 0.12 i.i.d.) and it
+destroys arrival specifically -- stopping falls 0.99 -> 0.40 -> 0.22 as the bias
+grows, which is exactly the clone's signature. But even crippled to the clone's
+own error magnitude the teacher still reaches 0.366, well above the clone's
+0.226, so **command-error magnitude alone does not explain the gap**.
+
+## 2026-08-07 (phase 160): the clone was never reproducing the oracle's STEERING -- the wheel-pair MSE cannot see it, and computing the command instead of regressing it fixes it at zero parameter cost
+
+Everything phases 156-159 reported as imitation quality was measured on the
+wrong coordinates. A differential-drive command is two numbers, and they are two
+orthogonal modes with completely different jobs:
+
+    speed = (L + R) / 2                            what the oracle holds nearly constant
+    turn  = (R - L) * 1.8 / (0.7 * (L + R))        what decides where the robot goes
+
+`turn` is exactly `simple_oracle._steer`'s own steering variable, and the speed
+scale cancels out of it. During `wall_following` the oracle's own turn has a
+standard deviation of **0.0093** on the decisions whose command encodes a steering
+angle at all -- it is a stabilising controller, so it holds itself straight --
+which is about **0.1% of the variance in the wheel pair**. An
+MSE on the pair therefore spends essentially all of itself on the common mode.
+
+### What that hid, measured on held-out ORACLE-DRIVEN data
+
+Not on the clone's own rollouts, where distribution shift could be blamed. On
+the teacher's own trajectories, which is the easiest data that exists:
+
+| run | wall_following motor MSE | median turn error | rms | R^2 | per-robot bias |
+|---|---|---|---|---|---|
+| round 0 (BC only) | 0.0012 | 0.0104 | 0.060 | -7.8 | 0.027 |
+| round 9 | 0.0036 | 0.0245 | 0.094 | -49.5 | 0.055 |
+| round 10 | 0.0027 | 0.0403 | 0.123 | **-173.5** | 0.085 |
+| round 11 | 0.0050 | 0.0411 | 0.131 | -133.3 | 0.101 |
+| round 12 | 0.0053 | 0.0521 | 0.124 | -131.6 | 0.094 |
+| round 13 | 0.0055 | 0.0521 | 0.147 | -170.7 | 0.123 |
+
+R^2 below zero means predicting the teacher's MEAN turn would have been better
+than what the network predicted. Round 10's correlation with the teacher's own
+steering is **-0.20** -- not weak, *anti*-correlated. So "88.5% of decisions
+within 0.05 on both wheels" was true and meant nothing: the clone reproduced the
+speed, which is nearly constant, and got the steering wrong by ten times the
+whole signal. Worse, most of that error is the PERSISTENT kind (bias 0.085 of an
+0.123 rms), which is exactly the kind phase 159's own controls showed destroys
+arrival: the oracle driven with a persistent bias of 0.10 drops from 0.99
+stopped to 0.40, while i.i.d. noise of 0.12 leaves it at 0.98.
+
+Every intervention of phases 156-159 made this monotonically worse while the
+headline MSE looked flat.
+
+### The information was there the whole time
+
+Reconstructing the teacher's `wall_following` command analytically from the
+actor's OWN observation -- `sin(latched wall tangent - belief heading)`, where
+the heading is `prop[10:12]` -- reproduces its turn with **rms 8e-5 and
+correlation 1.0000** over 350,702 held-out decisions, **100% of them within 5
+degrees**. There is no missing input and no missing capacity; there is a missing
+*operation*, and it is a product of a discrete latent (which wall) with a
+continuous input (the heading) that a linear head cannot form.
+
+`navigating` is the same story with the opposite answer, and this is the one
+genuine impossibility in the set: the actor already observes `prop[19:21]`, the
+sine and cosine of the bearing to its own assigned point relative to its own
+heading, which IS the `(cross, dot)` pair `_steer` takes. But the teacher steers
+by **its own particle filter** (`simple_belief`, a separate filter from the
+`worker.belief` that produces the observation), so the two disagree: median
+offset **-0.99 degrees** -- unbiased, so the formula is right -- with a spread of
+**55 degrees**, and only 32% of decisions within 5. That is not a defect in the
+actor. Its own filter is an equally good estimate; the teacher's exact command
+is simply not a function of what the actor can see.
+
+### The change: compose the command, do not regress it
+
+`kilobot_gnn.oracle_form_motor` builds the motor output as a soft mixture over
+the teacher's own five commands, each in closed form from quantities already in
+the observation, weighted by the state head's posterior:
+
+| state | command |
+|---|---|
+| go_north | (1, 1) |
+| turning | `TURN_MOTOR` |
+| wall_following | `_steer` against the latched wall's tangent (wall head's posterior), scaled by the approach slowdown from `conf_pos` |
+| navigating | `_steer` against the observed bearing to the robot's own target |
+| arrived | (0, 0) |
+
+**Zero new parameters and zero new inputs.** It reuses `head_state`,
+`head_wall` and `head_motor`, all of which already existed; the parameter count
+is unchanged at 24,498. What changes is that the network now supplies the two
+DISCRETE latents it is already good at (99% each) and the continuous steering is
+computed. The command is built in motor space and `squash_action` inverted, so
+the deployed path is untouched and the tanh's own 5x gradient attenuation at the
+0.9 operating point goes with it.
+
+### The residual had to be split, and that mattered more than expected
+
+The first version added a learned residual free to move both wheels
+independently. It spends itself correcting the SPEED -- which the closed form
+does get slightly wrong, because the approach slowdown reads the actor's own
+`conf_pos` and the teacher reads its own filter's -- and injects differential
+noise while doing it. Swept post-hoc on a trained network:
+
+| residual (common, differential) | median wall_following turn error | motor MSE |
+|---|---|---|
+| 0.05, 0.003 | 0.00850 | 0.00182 |
+| 0.05, 0.001 | 0.00290 | 0.00181 |
+| 0.05, 0.000 | **0.00058** | 0.00181 |
+
+A factor of **67** in the steering channel for no change in the MSE to three
+figures. So `head_motor`'s two outputs are now read as (common, differential)
+rather than (left, right), with separate scales, and `oracle_residual_turn`
+defaults to 0: the closed form is already exact wherever it CAN be exact, so a
+learned correction there has no legitimate job and the fit spends it hedging.
+
+### Result, held out
+
+| | params | wall MSE | median turn error | p90 | per-robot bias |
+|---|---|---|---|---|---|
+| round 10 (previous best) | 24,498 | 0.00267 | 0.04033 | 0.1096 | 0.0853 |
+| loss reweighting alone (`--steer-weight 5`) | 24,498 | 0.00960 | 0.01122 | 0.0386 | 0.0531 |
+| **oracle-form head** | 24,498 | **0.00110** | **0.00004** | **0.0006** | **0.0187** |
+| oracle-form head, gru_hidden 58 | 23,981 | 0.00193 | 0.00021 | 0.0060 | 0.0193 |
+
+A **1000-fold** reduction in the median steering error, and the motor MSE
+improves too. The loss-reweighting control is the important one: making the loss
+see the channel helps (0.040 -> 0.011) and does not come close, which is what
+says the problem is the missing operation and not the weighting.
+
+The remaining rms (0.049) is almost entirely a rare, TRANSIENT failure --
+decomposed on a trained network, the 0.2% of decisions where the state head is
+momentarily wrong contribute 31.5% of the squared error and the 0.9% where the
+wall head is wrong contribute 19%. Those emit a command from the wrong branch
+entirely. Transient error of that kind is the benign kind by phase 159's own
+controls; it is reported as median/p90/bias rather than hidden inside an rms.
+
+### Closed loop, the objective phase 159 defined
+
+Same 8 held-out arenas, same spawns, same 10000 ticks, `--swarm-rng 500 --seed 7`:
+
+| driver | coverage | stopped | settled <5u | median arena <5u | <10u | <20u |
+|---|---|---|---|---|---|---|
+| oracle | 0.638 | 0.988 | 0.416 | 40% | 47% | 67% |
+| round 10 | 0.242 | 0.084 | 0.019 | 2% | 2% | 3% |
+| **oracle-form head** | **0.630** | 0.734 | **0.303** | **31%** | **58%** | **69%** |
+
+The clone now matches the oracle on coverage, exceeds it at 10 and 20 units, and
+reaches 78% of it at 5 units, against a previous best of 2%. Arenas placing at
+least half their robots within 20 units: oracle 75%, this actor **100%**.
+
+**The honest remaining gap.** It stops 73% of its robots against the oracle's
+99%, so under phase 159's own rule -- only count an arena the driver actually
+finished, >= 95% stopped -- it still completes 0 of 8 arenas, and the stopped
+fraction is flat over the last 2000 ticks rather than still climbing. The last
+quarter of the swarm never satisfies the arrival condition. That, not steering,
+is now the binding constraint.
+
+### The 24KB budget
+
+The documented budget is 24KB as int8, i.e. 24,576 parameters, and 24,498 fits
+it. Read as a literal 24,000 it does not, and neither does any checkpoint in
+this project's history. `gru_hidden 58` gives 23,981 with no meaningful loss
+(median 0.00021 against 0.00004, and a slightly BETTER rms), so the literal
+reading is available at no real cost.
+
+### A reproducibility bug found on the way
+
+`save_actor` recorded which heads a checkpoint was built with but nothing about
+how WIDE they were, so anything trained with `--gru-hidden` could not be loaded
+back at all -- `build_actor` used config.py's default and `load_state_dict`
+rejected it on a shape mismatch. `kilobot_gnn.widths_from_state_dict` now reads
+the three widths off the checkpoint's own tensors, which is correct for every
+checkpoint ever written including the ones from before the meta field existed,
+and every loader uses it.
+
+## Handover: state of play as of 2026-08-07
+
+### The objective, stated once, precisely
+
+For each robot: did it **stop**, and is it **within X units of the point
+`observation.ensure_target` gave it**. Reported as a distribution over arenas,
+counting only arenas where the driver actually finished (>= 95% stopped).
+`tools/settle_report.py --metric settled` is the measurement. Coverage
+(`reward.coverage`) is NOT the objective and has a 0.286 chance floor; do not
+rank runs by it.
+
+### Where the numbers stand
+
+| | settle rate, median arena, within 5u | stops | arenas finished |
+|---|---|---|---|
+| oracle | 40% | 99% | 21 of 24 |
+| best clone (`run_r10`) | 2% | 8% | 0 of 8 |
+
+### What to reuse
+
+- **Warm start**: `results/bc_v2/run_r10/actor_best.pt`. Built with
+  `--activation elu --obs-noise 0.03 --state-head-weight 0.3 --wall-head-weight
+  0.3 --align-balance`, no steering feature. Its `meta` records every
+  architecture switch; `tools/eval_closed_loop.py` reads them back automatically.
+- **Data**: `results/bc_v2/tape_train.pt` (3.0M oracle-driven decisions) plus
+  `fixed_dagger_{1a,1b,2a,2b,3a,3b}.pt` (three clean DAgger rounds, 5.4M) and
+  `dart_{08,18}.pt` (expert-noise, 1.1M). Held-out validation:
+  `tape_val.pt` and `val_formations/` (2000 formations, seeded split 12345).
+  **`dagger_1..5.pt` (no `fixed_` prefix) are the CORRUPT tapes from phase 157 --
+  do not train on them.**
+- **Pipeline**: `python/scripts/bc_offline_pipeline.sh` runs the whole thing
+  (split, tapes, fit, DAgger rounds, evaluate, report) and skips completed
+  stages.
+
+### Two environment facts that bite
+
+1. **`KILOBOT_BAKE_ROTATION_STEPS` defaults to 1**, which makes Unity's baked
+   distance field -- the source of `node[:,4]`, and therefore of `coverage`,
+   `on_bonus` and `off_penalty` -- the geometry `formations.py` uses **rotated
+   90 degrees**. Every evaluation here passes `--bake-rotation-steps 0`. Any
+   reward-based work must fix this first or it optimises a different drawing.
+2. The oracle conditions on state the actor cannot see: its own particle filter
+   (`simple_belief` vs the actor's `worker.belief`), its own dead-reckoned
+   heading, and a wall latched once at the `go_north -> turning` transition.
+   Analytic reconstruction of its wall-following command from actor-observable
+   quantities is exact (0.0000) on the teacher's trajectories and 0.0346 on the
+   clone's -- that residual is the irreducible part.
+
+### What has been ruled out, by measurement
+
+Capacity (three nulls, up to 6.5x parameters), memory (99.8% state and wall
+accuracy on the clone's own rollouts), missing information (the reconstruction
+above), label quality (phase 157's bug, fixed), activation (phase 154's dying
+ReLU does not reproduce; the cause was the `[0,0]` arrived target), command
+precision alone (the bias controls), and DART-style expert noise (a stabilising
+teacher corrects back within a decision or two, so noise widens its state
+distribution far less than a DAgger round does).
+
+### Recommended next step
+
+Reward-based fine-tuning from `run_r10`, with the reward built from **distance to
+the robot's own assigned target** (`worker.simple_target`, python-side -- no new
+sensor and no observation change), potential-based shaping plus a terminal bonus
+for stopping inside X. Not the existing `coverage`-derived reward, both because
+it measures the wrong thing and because of the rotation above. Select checkpoints
+on the closed-loop settle rate, not on a tape score -- the two are anti-correlated
+in this regime.
+
+The ceiling to expect: the oracle itself settles a median of 40% of robots within
+5u and never exceeds 83% in any arena, because its particle filter mislocalizes a
+subset. Beating the clone substantially is well within reach; "most robots in
+most arenas" eventually runs into the filter, which is upstream of the policy.
+
+### Constraint the user has set
+
+Do not add or remove inputs or outputs, and do not change the sensors, the
+scenario bounds, or the oracle, without explicit approval. Transforming inputs
+the actor already receives is allowed (that is what `use_steer_feature` does).
+
+## 2026-08-10 (phase 161): the arrival gate, closed form in OR with the learned head -- the measured difference between "parks a third" and "certifies arrival"
+
+Phase 160 fixed steering; the residual gap to the oracle was not in the motors
+but in stopping. A differential drive's stop is a single bit — a robot that
+decides "arrived" turns itself off forever — and the learned arrived head that
+scored 0.99 recall on the tape under-fired in the field: closed loop, at the
+same 0.95 threshold it trained under, it pushed `stopped` to 0.734 but parked
+only 0.303 of the swarm within 5 units of a robot's OWN assigned point
+(`eval_o3_settled.json`, 8 arenas, 10000 ticks). The oracle does not have this
+problem because its `arrived` is not predicted, it is computed: particle-filter
+distance to the robot's own target below `cfg.tau_v`, once `conf_pos` passes the
+localisation floor.
+
+### The closed form cannot drift, but the actor's filter under-reports closeness
+
+`closed_form_arrived` (kilobot_gnn) runs that same rule on the actor's own
+observation, real time, from the four property slots the filter already emits:
+`PROP_DIST_T` (21), `PROP_CONF_POS` (12), and the `PROP_SIN_T`/`PROP_COS_T`
+(19, 20) pair that proves a target is assigned. Terminal, like the oracle's
+state. At the oracle's own radius (d < 0.05), the gate stopped 0.104 — the
+actor's filter under-reports closeness empirically by ~1.5x, so almost nobody
+crosses. At d < 0.08 it stopped 0.428 with a 0.295 settle <5u: tight arrivals,
+but as a replacement it under-fires. (both `eval_o3_cf.json`, `eval_o3_cf08.json`)
+
+### The two under-fire in different places, so OR is strictly a superset
+
+The head stops confident robots it was wrong about being close; the closed form
+stops only certified-tight arrivals. `actor_io._arrived_head_gate` with
+`closed_form_hybrid` runs both on the same tick and latches the OR. Measured on
+the 8-arena set (head 0.734, closed form 0.428):
+
+| branch | stopped | settled <5u | <10u | <20u | median err |
+|---|---|---|---|---|---|
+| oracle | 0.988 | 0.416 | 0.490 | 0.633 | 13.3u |
+| learned head | 0.734 | 0.303 | 0.566 | 0.677 | 7.2u |
+| closed form (d<0.08) | 0.428 | 0.295 | 0.413 | 0.425 | 6.4u |
+| **hybrid** | **0.841** | **0.487** | **0.671** | **0.743** | **4.9u** |
+
+The hybrid beats the oracle on every approximately-settled tolerance. The
+`who_fires` decomposition (`tools/hybrid_report.py`) attributes 402 robots head-
+only 32.6%, closed-form-only 5.7%, both 34.3%, moving 16.4% (the remainder are
+one rollout diverging from another — the report says so, not as a caveat but as
+the number). The hybrid's `OR` reproduces the union of the two branches'
+decisions on 82% of robots.
+
+### Ten-arena rerun
+
+The user asked for the report on ten distinct arenas; the four runs were
+re-run at 2 workers × 5 (`eval_*_10.json`, same `--swarm-rng 500`, `--seed 7`,
+same `run_o3/actor_best.pt`):
+
+| driver | stopped | settled <5u | <10u | <20u | median err | coverage |
+|---|---|---|---|---|---|---|
+| oracle | 0.996 | 0.375 | 0.489 | 0.638 | 12.6u | 0.629 |
+| learned head | 0.774 | 0.281 | 0.580 | 0.674 | 7.3u | 0.646 |
+| closed form (d<0.08) | 0.416 | 0.295 | 0.388 | 0.409 | 7.4u | 0.645 |
+| **hybrid** | **0.844** | **0.428** | **0.654** | **0.736** | **5.8u** | **0.700** |
+
+Same conclusion on fresh arenas: the OR is a strict superset, the hybrid beats
+the oracle on every settle tolerance, and coverage — which the closed form
+alone already lifted to 0.69 — is now above the oracle's. Full page with
+per-arena diagrams: `results/hybrid_cloning/index.html`.
+
+### Honest limits
+
+The per-robot `who_fires` split is across separate rollouts, so the attribution
+is indicative, not causal. The closed form's `has_target` guard means a robot
+the filter cannot assign a target to is never frozen by it — but that is the
+case phase 160 already measured for `navigating`, where the assignment is
+well-defined. The gate latching is what makes false positives irreversible;
+`arrived_release_threshold` (phase 156) is the hysteresis escape hatch, kept at
+0.5 in the eval runs as the pipeline already used.

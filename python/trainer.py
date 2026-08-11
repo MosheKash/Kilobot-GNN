@@ -36,6 +36,21 @@ except Exception:
 STRENGTH_COL = MESSAGE_SIZE + 1
 
 
+def _sorted_png_position(folder, name):
+    """Sorted position of a formation filename within a folder, matching Unity's
+    ImageLibrary.files[] ordering (Directory.GetFiles(dir, "*.png") sorted with
+    StringComparer.Ordinal). This is the index Unity uses for the floor
+    background texture AND the baked distance field, so it is the only safe
+    integer to send back over send_image/send_reset. Returns the folder's
+    position of `name`, or -1 if it is not present (so a caller can fall back).
+    """
+    full = sorted(n for n in os.listdir(folder) if n.endswith(".png"))
+    try:
+        return full.index(name)
+    except ValueError:
+        return -1
+
+
 def sample_message(messages, generator=None):
     n = messages.shape[0]
     if n == 1:
@@ -79,21 +94,23 @@ def check_startup_coverage(stats, min_start_cov):
 
 
 class Trainer:
-    def __init__(self, env, critic_channel, params_channel, cfg, encoder, image_pool, behavior_name, image_names = None):
+    def __init__(self, env, critic_channel, params_channel, cfg, encoder, image_pool, behavior_name, image_names = None, formations_dir = None):
         self.cfg = cfg
         self.encoder = encoder
         self.image_pool = image_pool
         self.image_names = image_names
+        self.formations_dir = formations_dir
         self.workers = [EnvWorker(env, critic_channel, params_channel, behavior_name)]
         self._init_globals()
 
     @classmethod
-    def from_workers(cls, workers, cfg, encoder, image_pool, image_names = None):
+    def from_workers(cls, workers, cfg, encoder, image_pool, image_names = None, formations_dir = None):
         self = cls.__new__(cls)
         self.cfg = cfg
         self.encoder = encoder
         self.image_pool = image_pool
         self.image_names = image_names
+        self.formations_dir = formations_dir
         self.workers = list(workers)
         self._init_globals()
         return self
@@ -154,23 +171,40 @@ class Trainer:
         # direct index into the full, sorted folder listing (unaware of
         # Python's sampling at all), sending the local pool index sends the
         # wrong file every time a limit narrower than the full folder is in
-        # effect. Files in this project's data are named %06d.png, matching
-        # their sorted position in the full folder directly -- e.g.
-        # 117264.png genuinely is entry 117264 -- so the absolute index can
-        # be recovered directly from the filename already tracked in
-        # image_names, without needing formation_paths or build_image_pool
-        # to change what they return at all. Falls back to the local index
-        # unchanged whenever image_names isn't available or a name doesn't
-        # parse as purely numeric, so a non-standard formations folder
-        # degrades to the old behavior rather than crashing.
+        # effect.
+        #
+        # The integer Unity receives is a POSITION into ImageLibrary's own
+        # sorted listing of the formations folder (files[imageId], and the
+        # same index into the baked distance field used for node[:,4]). So
+        # the only correct value to send is the target file's sorted position
+        # within that same folder.
+        #
+        # The historical implementation returned the numeric stem of the file
+        # name (e.g. 54 for 000054.png) on the assumption that the folder is a
+        # CONTIGUOUS %06d set where sorted position == numeric name -- true
+        # for data/formations, FALSE for a non-contiguous subsample like
+        # results/bc_v2/val_formations (position 54 there is 004025.png, not
+        # 000054.png). Sending val_formations' stems sent Unity far out of its
+        # sorted array, so ImageLibrary.GetTexture returned null (the target-
+        # formation background image never appears on the floor) and
+        # ImageLibrary.Sample fell back to distance 1.0 everywhere, silently
+        # corrupting every coverage number. Send the true sorted position
+        # instead, which is correct for contiguous and non-contiguous folders
+        # alike. Falls back to the local index unchanged whenever the folder
+        # listing or a name lookup is unavailable, so a non-standard formations
+        # folder degrades to the old behaviour rather than crashing.
         image_names = getattr(self, "image_names", None)
         if image_names is None or index >= len(image_names):
             return index
         name = image_names[index]
-        stem = name.rsplit(".", 1)[0] if "." in name else name
-        if not stem.isdigit():
+        formations = getattr(self, "formations_dir", None)
+        if not formations:
             return index
-        return int(stem)
+        try:
+            pos = _sorted_png_position(formations, name)
+            return pos if pos >= 0 else index
+        except Exception:
+            return index
 
     def _reset_arena(self, worker, k, send_reset=True):
         index, image = self._pick_image()

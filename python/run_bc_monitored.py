@@ -983,9 +983,21 @@ def main():
     def shadow_act(buffer, policy, worker, decision_steps, cfg, rng, deterministic = False, bc_capture = False,
                    probe = False, probe_log = None, audit = False, audit_log = None,
                    pos_track = False, pos_log = None):
-        result = orig_act(buffer, policy, worker, decision_steps, cfg, rng, deterministic = deterministic,
-                          bc_capture = bc_capture, probe = probe, probe_log = probe_log, audit = audit,
-                          audit_log = audit_log, pos_track = pos_track, pos_log = pos_log)
+        # The shadow runs BEFORE act(), and the order is load-bearing.
+        # simple_oracle_motors derives this tick's motion from
+        # `step_count - last_dec_step[a][l]`, and act() sets last_dec_step to
+        # step_count for every robot it commands -- so called afterwards the
+        # shadow sees steps_since == 0 for every robot, dead-reckons zero
+        # motion, never advances its particle filter and never accumulates any
+        # rotation. Its turn can then never complete, which pins every robot in
+        # `turning` forever and makes `shadow_says_arrived` permanently false:
+        # actor_state_pct reads as go_north/turning only, and every arrived call
+        # the actor makes is counted as actor_only by construction. Measured
+        # directly: over an identical 1500-tick rollout the shadow reported
+        # 22292 go_north / 48922 turning / 0 / 0 with the old ordering and
+        # 19909 / 3097 / 39649 wall_following / 4443 navigating with this one.
+        # actor_io.act's own bc_capture path calls the oracle before the same
+        # update, for the same reason.
         if cfg.motor_override == "none" and len(decision_steps) > 0:
             vector, _ = actor_io.split_obs(decision_steps.obs, cfg.device)
             arena_ids = vector[:, 0].long()
@@ -993,6 +1005,10 @@ def main():
             walls = vector[:, 2 + SEED_SIZE:2 + SEED_SIZE + WALL_SIZE]
             orig_oracle_motors(worker, arena_ids, locals_, walls, None, cfg, rng,
                               getattr(cfg, "_oracle_formation_pool", None), belief_attr = "actor_shadow_belief")
+        result = orig_act(buffer, policy, worker, decision_steps, cfg, rng, deterministic = deterministic,
+                          bc_capture = bc_capture, probe = probe, probe_log = probe_log, audit = audit,
+                          audit_log = audit_log, pos_track = pos_track, pos_log = pos_log)
+        if cfg.motor_override == "none" and len(decision_steps) > 0:
             for states_in_arena in worker.simple_state.values():
                 for s in states_in_arena.values():
                     if s in actor_state_ticks:
