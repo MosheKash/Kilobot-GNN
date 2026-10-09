@@ -143,12 +143,26 @@ def _true_heading_deg(worker, a, l):
 
 
 def simple_oracle_motors(worker, arena_ids, locals_, walls, wall_seed_xy, cfg, rng, formation_pool,
-                         belief_attr = "belief"):
-    # walls: (n, WALL_SIZE) raw wall observation strengths -- the same received
+                         belief_attr = "belief", shared_event = None, seeds = None, rows = None,
+                         valid = None):
+    # walls: (n, WALL_SIZE) wall observation strengths -- the same received
     # transmission channel the rest of the pipeline reads, never privileged.
     # wall_seed_xy: (n, WALL_SIZE, 2) or None, every wall side's broadcast
     # position; narrowed below to the single side that fired, (n, 2), which is
     # the shape belief_update expects.
+    #
+    # shared_event: optional (seed_obs, wall_obs, wall_seed_xy) -- the tick's
+    # ALREADY-narrowed single event, as sample_split_event returned it to the
+    # actor pipeline (seed_obs (n, SEED_SIZE), wall_obs (n, WALL_SIZE) one-winner,
+    # wall_seed_xy (n, 2) or None). A Kilobot has one IR receiver, so the tick
+    # has one ground-truth event; when the caller has already drawn it, this
+    # oracle consumes it and does NOT draw again (docs/tuning.md phase 162: the
+    # historical second draw made ~5% of BC labels inconsistent with their
+    # inputs). When None, this call owns the reception and draws once itself:
+    # under cfg.oracle_shared_event from the full physical pool (seeds + walls +
+    # neighbours, via the seeds/rows/valid arguments), else legacy wall-only
+    # dummies. The filter instances stay separate regardless -- belief_attr --
+    # because only the observation is shared, never the posterior.
     #
     # belief_attr lets this oracle's particle filter live under a worker
     # attribute other than worker.belief. Needed when this runs alongside
@@ -166,23 +180,36 @@ def simple_oracle_motors(worker, arena_ids, locals_, walls, wall_seed_xy, cfg, r
     device = walls.device
     motor = torch.zeros(n, MOTOR_SIZE, device = device)
 
-    # Enforce "at most one wall side per tick" using sample_split_event itself,
-    # the same strength-weighted draw the trained-policy pipeline uses, rather
-    # than a local "loudest wins" argmax -- so the actor under BC training sees
-    # decisions generated under the same selection process its own observations
-    # are drawn from. Reusing the function rather than reimplementing the draw
-    # keeps the two from drifting apart if its weighting is ever retuned.
-    #
-    # Its pool also spans seeds and neighbour messages, which this wall-only
-    # oracle has no logic for, so those are passed in genuinely empty: they
-    # carry zero weight and can never win the draw, leaving wall selection the
-    # only thing this call decides. wall_part comes back already masked to one
-    # winner, and wall_seed_xy already narrowed to (n, 2).
-    dummy_seeds = torch.zeros(n, SEED_SIZE, device = device)
-    dummy_rows = torch.zeros(n, 1, MESSAGE_SIZE + 2, device = device)
-    dummy_valid = torch.zeros(n, 1, dtype = torch.bool, device = device)
-    _tc, _seed_part, walls, wall_seed_xy = sample_split_event(
-        dummy_seeds, walls, dummy_rows, dummy_valid, cfg, rng, wall_seed_xy = wall_seed_xy)
+    if shared_event is not None:
+        # The caller owns the tick's single draw (the same one the actor's tc
+        # encodes). Walls and wall_seed_xy arrive already narrowed to one
+        # winner, so the state machine's "walls[i].sum() > 0" tests now mean
+        # "the wall channel won this tick's single reception" -- the honest
+        # one-receiver semantics.
+        event_seed_obs, walls, wall_seed_xy = shared_event
+    else:
+        # Enforce "at most one wall side per tick" using sample_split_event itself,
+        # the same strength-weighted draw the trained-policy pipeline uses, rather
+        # than a local "loudest wins" argmax -- so the actor under BC training sees
+        # decisions generated under the same selection process its own observations
+        # are drawn from. Reusing the function rather than reimplementing the draw
+        # keeps the two from drifting apart if its weighting is ever retuned.
+        #
+        # Under cfg.oracle_shared_event this is a full physical pool: seeds and
+        # neighbour messages compete with walls, exactly as they do for the
+        # actor's own tc. Without it (legacy), the pool is wall-only -- seeds
+        # and neighbours are passed in genuinely empty so they carry zero
+        # weight and can never win. wall_part comes back already masked to one
+        # winner, and wall_seed_xy already narrowed to (n, 2).
+        if getattr(cfg, "oracle_shared_event", False) and seeds is not None and rows is not None:
+            _tc, event_seed_obs, walls, wall_seed_xy = sample_split_event(
+                seeds, walls, rows, valid, cfg, rng, wall_seed_xy = wall_seed_xy)
+        else:
+            dummy_seeds = torch.zeros(n, SEED_SIZE, device = device)
+            dummy_rows = torch.zeros(n, 1, MESSAGE_SIZE + 2, device = device)
+            dummy_valid = torch.zeros(n, 1, dtype = torch.bool, device = device)
+            _tc, event_seed_obs, walls, wall_seed_xy = sample_split_event(
+                dummy_seeds, walls, dummy_rows, dummy_valid, cfg, rng, wall_seed_xy = wall_seed_xy)
 
     if not hasattr(worker, "simple_heading"):
         worker.simple_heading = {}
@@ -312,9 +339,19 @@ def simple_oracle_motors(worker, arena_ids, locals_, walls, wall_seed_xy, cfg, r
     # docstring for why
     particles_batch = belief_predict(particles_batch, x_local, y_local, dtheta, rng,
                                      heading_noise_scale=HEADING_NOISE_SCALE)
-    seed_obs = torch.zeros(n, SEED_SIZE, device=device)
-    particles_batch = belief_update(particles_batch, seed_obs, rng, wall_obs=walls,
-                                    wall_seed_xy=wall_seed_xy, heading_noise_scale=HEADING_NOISE_SCALE)
+    # The seed observation this tick's single event carried. Historically
+    # hard-zeroed: this filter was wall-only, which only worked because the
+    # oracle's private wall-only draw awarded it the strongest wall on ~93% of
+    # ticks -- more reception than the one-receiver model allows. Under the
+    # one-event regime that crutch is gone, and seed fusion -- the same ranging
+    # fusion against known-position beacons the actor's own filter performs --
+    # is what keeps localization strong (docs/tuning.md phase 162).
+    if getattr(cfg, "oracle_fuse_seeds", False):
+        seed_obs = event_seed_obs
+    else:
+        seed_obs = torch.zeros(n, SEED_SIZE, device = device)
+    particles_batch = belief_update(particles_batch, seed_obs, rng, wall_obs = walls,
+                                    wall_seed_xy = wall_seed_xy, heading_noise_scale = HEADING_NOISE_SCALE)
     conf_batch = belief_conf(particles_batch)
     br_batch = belief_read(particles_batch)
 

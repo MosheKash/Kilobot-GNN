@@ -79,6 +79,9 @@ def build_parser():
                     help = "with --closed-form-arrived, run the closed-form rule in OR with the "
                            "learned arrived head instead of replacing it (config.py's own "
                            "closed_form_hybrid)")
+    ap.add_argument("--closed-form-and", action = "store_true",
+                    help = "with --closed-form-arrived, run the closed-form rule in AND with the "
+                           "learned arrived head: stop only when BOTH branches agree")
     ap.add_argument("--freeze-hidden", dest = "freeze_hidden", action = "store_true", default = False,
                     help = "config.py's own arrived_freeze_hidden. Off by default here, unlike the "
                            "Config default: a checkpoint trained by bc_offline.py has seen the "
@@ -207,6 +210,7 @@ def main(argv = None):
     cfg.use_closed_form_arrived = args.closed_form_arrived
     cfg.closed_form_arrival_dist = args.closed_form_dist
     cfg.closed_form_hybrid = args.closed_form_hybrid
+    cfg.closed_form_and_gate = args.closed_form_and
     cfg.arrived_freeze_hidden = args.freeze_hidden
     cfg.oracle_wall_seed_position = args.wall_seed_position
     # matches run_bc_monitored.build_train_cfg, which is what every tape and

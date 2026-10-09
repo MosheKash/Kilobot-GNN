@@ -19,6 +19,7 @@ from buffer import RolloutBuffer
 from ppo import ppo_update
 from metrics import Logger
 from trainer import check_startup_coverage, conf_bonus_schedule
+from trainer import shaping_schedule
 from metrics import rollout_stats, aggregate_payloads
 from checkpoint import save_checkpoint, export_actor
 from kilobot_gnn import DB_ROW_SIZE
@@ -208,6 +209,7 @@ def worker_loop(worker_id, cfg, in_q, out_q):
             if isinstance(payload, dict) and "policy" in payload:
                 policy.load_state_dict(payload["policy"])
                 cfg.belief_conf_bonus = payload.get("belief_conf_bonus", getattr(cfg, "belief_conf_bonus", 0.0))
+                cfg.reward_shaping = payload.get("reward_shaping", getattr(cfg, "reward_shaping", 0.0))
             else:
                 policy.load_state_dict(payload)
             buffer = trainer.collect(policy, None)
@@ -261,13 +263,16 @@ class ParallelTrainer:
         step = start_iter * total_steps
         bonus0 = getattr(self.cfg, "belief_conf_bonus", 0.0)
         bonus_iters = getattr(self.cfg, "belief_conf_bonus_iters", 0)
+        shaping0 = getattr(self.cfg, "reward_shaping", 0.0)
         summary_status = "error"
         try:
             for it in range(start_iter, iterations):
                 t0 = time.time()
                 self.cfg.belief_conf_bonus = conf_bonus_schedule(bonus0, bonus_iters, it)
+                self.cfg.reward_shaping = shaping_schedule(shaping0, iterations, it)
                 state = {k: v.detach().cpu() for k, v in policy.state_dict().items()}
-                blob = pickle.dumps({"policy": state, "belief_conf_bonus": self.cfg.belief_conf_bonus})
+                blob = pickle.dumps({"policy": state, "belief_conf_bonus": self.cfg.belief_conf_bonus,
+                                     "reward_shaping": self.cfg.reward_shaping})
                 for q in self.in_qs:
                     q.put(blob)
 

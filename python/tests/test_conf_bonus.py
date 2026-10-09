@@ -4,7 +4,7 @@ import torch
 
 from belief import belief_conf, belief_read, belief_init
 from config import Config
-from trainer import Trainer, conf_bonus_schedule
+from trainer import Trainer, conf_bonus_schedule, shaping_schedule
 from buffer import RolloutBuffer
 import conftest
 from conftest import FakeSteps as _Steps, MAX_ROWS
@@ -43,6 +43,16 @@ def test_conf_bonus_schedule_anneals_linearly_and_clamps():
     assert conf_bonus_schedule(0.05, 10, 25) == 0.0
     assert conf_bonus_schedule(0.05, 0, 7) == 0.05
     assert conf_bonus_schedule(0.0, 10, 3) == 0.0
+
+
+def test_shaping_schedule_matches_proposal_phases():
+    assert shaping_schedule(5.0, 300, 0) == 5.0
+    assert shaping_schedule(5.0, 300, 49) == 5.0
+    assert abs(shaping_schedule(5.0, 300, 50) - 2.0) < 1e-9
+    assert abs(shaping_schedule(5.0, 300, 149) - 2.0) < 1e-9
+    assert shaping_schedule(5.0, 300, 150) == 0.0
+    assert shaping_schedule(5.0, 300, 299) == 0.0
+    assert shaping_schedule(0.0, 300, 5) == 0.0
 
 
 def _empty_steps():

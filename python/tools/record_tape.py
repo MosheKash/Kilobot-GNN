@@ -103,6 +103,15 @@ def build_args(argv = None):
                            "point of a DAgger tape is the states the actor's own mistakes lead "
                            "to, so this should be whatever deployment uses")
     ap.add_argument("--arrived-release-threshold", type = float, default = 0.0)
+    ap.add_argument("--closed-form-arrived", action = "store_true",
+                    help = "gate the actor's stop on the oracle's own closed-form arrival rule "
+                           "(see tools/eval_closed_loop.py)")
+    ap.add_argument("--closed-form-dist", type = float, default = 0.0,
+                    help = "arrival radius for --closed-form-arrived in normalized units; "
+                           "0 = cfg.tau_v")
+    ap.add_argument("--closed-form-hybrid", action = "store_true",
+                    help = "with --closed-form-arrived, run the closed-form rule in OR with the "
+                           "learned arrived head")
     ap.add_argument("--freeze-hidden", dest = "freeze_hidden", action = "store_true", default = False,
                     help = "config.py's own arrived_freeze_hidden; off by default, matching "
                            "tools/eval_closed_loop.py")
@@ -138,6 +147,9 @@ def make_cfg(args):
     cfg = R.build_train_cfg(ns)
     cfg.bc_replay_capacity = 0
     cfg.bc_replay_persist = False
+    cfg.use_closed_form_arrived = args.closed_form_arrived
+    cfg.closed_form_arrival_dist = args.closed_form_dist
+    cfg.closed_form_hybrid = args.closed_form_hybrid
     return cfg
 
 
@@ -161,8 +173,8 @@ def main(argv = None):
     if args.driver == "actor":
         if not args.weights:
             raise SystemExit("--driver actor needs --weights")
-        meta = (torch.load(args.weights, map_location = "cpu", weights_only = False)
-                .get("meta", {}) or {})
+        blob = torch.load(args.weights, map_location = "cpu", weights_only = False)
+        meta = blob.get("meta", {}) or {}
         # The architecture switches are properties of the checkpoint, not of
         # this command line: loading a checkpoint into an actor built with
         # different ones is either a hard state_dict error (the two width
@@ -183,6 +195,9 @@ def main(argv = None):
     cfg.arrived_confidence_threshold = args.arrived_threshold
     cfg.arrived_release_threshold = args.arrived_release_threshold
     cfg.arrived_freeze_hidden = args.freeze_hidden
+    cfg.use_closed_form_arrived = args.closed_form_arrived
+    cfg.closed_form_arrival_dist = args.closed_form_dist
+    cfg.closed_form_hybrid = args.closed_form_hybrid
     cfg.use_state_head = bool(getattr(args, "_use_state_head", False))
     cfg.use_wall_head = bool(getattr(args, "_use_wall_head", False))
     cfg.use_steer_feature = bool(getattr(args, "_use_steer_feature", False))
@@ -354,9 +369,9 @@ def install_expert_noise(sigma):
     clean = {}
 
     def noisy_motors(worker, arena_ids, locals_, walls, wall_seed_xy, cfg, rng, formation_pool,
-                     belief_attr = "belief"):
+                     belief_attr = "belief", **kw):
         motor = orig_motors(worker, arena_ids, locals_, walls, wall_seed_xy, cfg, rng,
-                            formation_pool, belief_attr = belief_attr)
+                            formation_pool, belief_attr = belief_attr, **kw)
         if motor is None:
             return motor
         clean.clear()
@@ -418,18 +433,46 @@ def install_shadow_labeller():
     orig_act = actor_io.act
 
     def act_and_label(buffer, policy, worker, decision_steps, cfg, rng, *a, **kw):
-        # The oracle runs BEFORE act(), not after, and the ordering is
-        # load-bearing rather than stylistic. simple_oracle_motors derives this
-        # tick's motion from `step_count - last_dec_step[a][l]`, and act() sets
-        # last_dec_step to step_count for every robot it commands. Called
-        # afterwards, the oracle therefore sees steps_since == 0 for every
-        # robot, dead-reckons zero motion, never advances its particle filter
-        # and never accumulates any rotation -- so its turn never completes, its
-        # belief never converges, and every label it produces past the first
-        # tick is computed from a frozen pose. actor_io.act's own bc_capture
-        # path calls the oracle before the same update for exactly this reason.
+        # Ordering is load-bearing, in one of two ways depending on
+        # cfg.oracle_shared_event.
+        #
+        # Legacy (shared_event off): the oracle runs BEFORE act(). The ordering
+        # matters because simple_oracle_motors derives this tick's motion from
+        # `step_count - last_dec_step[a][l]`, and act() sets last_dec_step to
+        # step_count for every robot it commands. Called afterwards, the oracle
+        # therefore sees steps_since == 0 for every robot, dead-reckons zero
+        # motion, never advances its particle filter and never accumulates any
+        # rotation -- so its turn never completes, its belief never converges,
+        # and every label it produces past the first tick is computed from a
+        # frozen pose. actor_io.act's own bc_capture path calls the oracle
+        # before the same update for exactly this reason.
+        #
+        # Shared event (docs/tuning.md phase 162): the tick has ONE ground-truth
+        # event and act() owns its draw, so the shadow runs AFTER act() and
+        # consumes worker._last_shared_event -- the same narrowed event the
+        # actor's tc encodes. Running after act() reintroduces the frozen-pose
+        # problem above (act() has already updated last_motor/last_dec_step for
+        # every robot it commanded), so the shadow brackets orig_act with a
+        # per-robot odometry snapshot: pre-act values restored for the oracle's
+        # dead reckoning, post-act values re-applied afterwards so the actor
+        # pipeline's own bookkeeping is untouched. act() assigns
+        # last_motor[a][l] / last_dec_step[a][l] entry-wise (never mutates a
+        # captured tensor in place), so per-robot reference capture is exact --
+        # the same machinery the phase-162 audit twin used, validated there to
+        # reproduce the oracle bit-exactly.
         labels = {}
-        if cfg.motor_override == "none" and len(decision_steps) > 0:
+        ids = []
+        pre_odom = {}
+        shared = getattr(cfg, "oracle_shared_event", False) and cfg.motor_override == "none" \
+            and len(decision_steps) > 0
+        if shared:
+            vector, _ = actor_io.split_obs(decision_steps.obs, cfg.device)
+            ids = [(int(a), int(l))
+                   for a, l in zip(vector[:, 0].tolist(), vector[:, 1].tolist())]
+            pre_odom = {(a, l): (worker.last_motor.get(a, {}).get(l),
+                                 worker.last_dec_step.get(a, {}).get(l))
+                        for a, l in ids}
+        if cfg.motor_override == "none" and len(decision_steps) > 0 and not shared:
             device = cfg.device
             vector, rows = actor_io.split_obs(decision_steps.obs, device)
             rows, wall_seed_xy_unity = actor_io._extract_wall_seed_rows(rows, device)
@@ -450,6 +493,45 @@ def install_shadow_labeller():
 
         n0 = len(buffer.decisions)
         result = orig_act(buffer, policy, worker, decision_steps, cfg, rng, *a, **kw)
+
+        if shared:
+            event = getattr(worker, "_last_shared_event", None)
+            vector, rows = actor_io.split_obs(decision_steps.obs, cfg.device)
+            rows, wall_seed_xy_unity = actor_io._extract_wall_seed_rows(rows, cfg.device)
+            arena_ids = vector[:, 0].long()
+            locals_ = vector[:, 1].long()
+            walls = vector[:, 2 + SEED_SIZE:2 + SEED_SIZE + WALL_SIZE]
+            wall_seed_xy = actor_io._resolve_wall_seed_xy(worker, arena_ids, locals_, cfg, cfg.device,
+                                                          wall_seed_xy_unity)
+            post_odom = {(a, l): (worker.last_motor.get(a, {}).get(l),
+                                  worker.last_dec_step.get(a, {}).get(l))
+                         for a, l in ids}
+
+            def _apply_odom(store):
+                for a, l in ids:
+                    lm, lds = store[(a, l)]
+                    if lm is None:
+                        worker.last_motor.get(a, {}).pop(l, None)
+                    else:
+                        worker.last_motor.setdefault(a, {})[l] = lm
+                    if lds is None:
+                        worker.last_dec_step.get(a, {}).pop(l, None)
+                    else:
+                        worker.last_dec_step.setdefault(a, {})[l] = lds
+
+            _apply_odom(pre_odom)
+            if event is not None:
+                motors = SO.simple_oracle_motors(worker, arena_ids, locals_, walls, wall_seed_xy,
+                                                 cfg, rng, getattr(cfg, "_oracle_formation_pool", None),
+                                                 belief_attr = "simple_belief", shared_event = event)
+                for i in range(int(arena_ids.shape[0])):
+                    a_id = int(arena_ids[i]); l = int(locals_[i])
+                    arrived = getattr(worker, "simple_state", {}).get(a_id, {}).get(l) == "arrived"
+                    labels[(a_id, l)] = (motors[i].detach().cpu(),
+                                         getattr(worker, "simple_motor_state", {}).get(a_id, {}).get(l),
+                                         torch.tensor([1.0 if arrived else 0.0]))
+            _apply_odom(post_odom)
+
         for d in buffer.decisions[n0:]:
             a_id = int(buffer.steps[d["step_index"]]["arena_id"])
             entry = labels.get((a_id, int(d["local"])))

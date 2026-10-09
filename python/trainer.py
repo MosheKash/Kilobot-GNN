@@ -83,6 +83,23 @@ def conf_bonus_schedule(base, horizon, it):
     return base * frac
 
 
+def shaping_schedule(base, iterations, it):
+    """The proposal's shaping curriculum: k for the first 1/6, k*0.4 for the
+    middle 1/3, 0 for the final half. With the proposal's 300 iterations that
+    lands on exactly 5.0 (0-50), 2.0 (50-150), 0.0 (150-300), which are the
+    plan's stated phase boundaries.
+    """
+    if base <= 0.0:
+        return 0.0
+    if iterations <= 0:
+        return base
+    if it < iterations / 6.0:
+        return base
+    if it < iterations / 2.0:
+        return base * 0.4
+    return 0.0
+
+
 def check_startup_coverage(stats, min_start_cov):
     cov0 = stats.get("rollout/mean_coverage", 0.0)
     if cov0 < 0.05:
@@ -650,10 +667,12 @@ class Trainer:
         step = start_iter * self.cfg.rollout_steps
         bonus0 = getattr(self.cfg, "belief_conf_bonus", 0.0)
         bonus_iters = getattr(self.cfg, "belief_conf_bonus_iters", 0)
+        shaping0 = getattr(self.cfg, "reward_shaping", 0.0)
         summary_status = "error"
         try:
             for it in range(start_iter, iterations):
                 self.cfg.belief_conf_bonus = conf_bonus_schedule(bonus0, bonus_iters, it)
+                self.cfg.reward_shaping = shaping_schedule(shaping0, iterations, it)
                 t0 = time.time()
                 buffer = self.collect(policy, critic)
                 t_collect = time.time() - t0

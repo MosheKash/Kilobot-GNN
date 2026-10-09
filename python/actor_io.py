@@ -203,13 +203,17 @@ def _warn_missing_spawn_heading_column(worker, cfg, vector):
 
 
 def _drive_simple_oracle(worker, arena_ids, locals_, walls, cfg, rng, device,
-                         wall_seed_xy_unity, actions, n):
+                         wall_seed_xy_unity, actions, n, seeds = None, rows = None):
     """The simple_oracle short-circuit: command motors and nothing else.
 
     A genuinely separate path, not touching anything else in act()
     (scripted_motors, the trained-policy observation-building and buffer
     machinery) at all -- it returns
     as soon as arena_ids/locals_/walls exist, before the rest of act() runs.
+    seeds/rows: the same tick's seed strengths and neighbour database, handed
+    through so that under cfg.oracle_shared_event the oracle's own draw is the
+    full physical pool (its reception IS the tick's event on this path --
+    nothing else consumes it), rather than the legacy wall-only one.
     See simple_oracle.py's own module docstring for the full state machine.
 
     act() gates this on "not bc_capture". Behaviour cloning needs the
@@ -226,9 +230,13 @@ def _drive_simple_oracle(worker, arena_ids, locals_, walls, cfg, rng, device,
     import simple_oracle
     # wall_seed_xy_unity, extracted from the player's message rows.
     wall_seed_xy = _resolve_wall_seed_xy(worker, arena_ids, locals_, cfg, device, wall_seed_xy_unity)
+    valid = None
+    if rows is not None:
+        valid = rows.abs().sum(dim = 2) > 0
     motor = simple_oracle.simple_oracle_motors(worker, arena_ids, locals_, walls,
                                                wall_seed_xy, cfg, rng,
-                                               getattr(cfg, "_oracle_formation_pool", None))
+                                               getattr(cfg, "_oracle_formation_pool", None),
+                                               seeds = seeds, rows = rows, valid = valid)
     for i in range(n):
         a = int(arena_ids[i]); l = int(locals_[i])
         worker.last_motor.setdefault(a, {})[l] = motor[i].detach().clone()
@@ -491,6 +499,10 @@ def _arrived_head_gate(worker, policy, cfg, a, l, idx, closed_form = None):
     With cfg.closed_form_hybrid the closed form runs in OR with the learned
     head instead of replacing it: the two miss different robots, so either
     stopping catches more of both. Terminal either way.
+
+    With cfg.closed_form_and_gate the two run in AND: a robot stops only when
+    the closed form AND the learned head both fire. This is the conservative
+    complement of hybrid -- nobody stops on a single detector's vote.
     """
     if cfg.motor_override != "none":
         return False
@@ -500,8 +512,11 @@ def _arrived_head_gate(worker, policy, cfg, a, l, idx, closed_form = None):
     if getattr(cfg, "use_closed_form_arrived", False):
         if closed_form is None:
             return False
-        if getattr(cfg, "closed_form_hybrid", False) and policy.actor.head_arrived is not None:
-            p_arrived = torch.sigmoid(policy.actor._arrived_logit[idx]).item()
+        p_arrived = (torch.sigmoid(policy.actor._arrived_logit[idx]).item()
+                     if policy.actor.head_arrived is not None else 0.0)
+        if getattr(cfg, "closed_form_and_gate", False) and policy.actor.head_arrived is not None:
+            fire = bool(closed_form[idx]) and bool(p_arrived > cfg.arrived_confidence_threshold)
+        elif getattr(cfg, "closed_form_hybrid", False) and policy.actor.head_arrived is not None:
             fire = bool(closed_form[idx]) or bool(p_arrived > cfg.arrived_confidence_threshold)
         else:
             fire = bool(closed_form[idx])
@@ -563,7 +578,7 @@ def act(buffer, policy, worker, decision_steps, cfg, rng, deterministic = False,
 
     if cfg.motor_override == "simple_oracle" and not bc_capture:
         _drive_simple_oracle(worker, arena_ids, locals_, walls, cfg, rng, device,
-                             wall_seed_xy_unity, actions, n)
+                             wall_seed_xy_unity, actions, n, seeds = seeds, rows = rows)
         worker.set_actions(actions.numpy())
         return event_counts
 
@@ -604,6 +619,14 @@ def act(buffer, policy, worker, decision_steps, cfg, rng, deterministic = False,
         wall_seed_xy = _resolve_wall_seed_xy(worker, arena_ids, locals_, cfg, device, wall_seed_xy_unity)
         tc_b, seed_narrowed, wall_narrowed, wall_seed_xy_narrowed = sample_split_event(
             seeds, walls, rows, valid, cfg, rng, wall_seed_xy = wall_seed_xy)
+        if getattr(cfg, "oracle_shared_event", False):
+            # THE tick's single event, stashed for consumers that run outside
+            # act() but must observe the same reception -- today only
+            # record_tape's DAgger shadow labeller (post-act, odometry
+            # restored). A Kilobot has one IR receiver: there is one event per
+            # tick, and whoever queries the expert must query it about THIS
+            # event, not a second draw of it (docs/tuning.md phase 162).
+            worker._last_shared_event = (seed_narrowed, wall_narrowed, wall_seed_xy_narrowed)
         # True heading is no longer read here at all
         # -- confirmed directly as a genuine, unintentional privileged-
         # information leak into the actor's own observations, not just the
@@ -667,9 +690,17 @@ def act(buffer, policy, worker, decision_steps, cfg, rng, deterministic = False,
         import simple_oracle
         assert split_obs_actor, \
             "simple_oracle is only wired for actor_type='gru_split_observation', not %r" % actor_type
+        # cfg.oracle_shared_event: the draw just above IS the tick's single
+        # physical reception -- hand the oracle the same narrowed event the
+        # stored tc encodes, so the (input, label) pair is consistent by
+        # construction (docs/tuning.md phase 162).
+        shared_event = None
+        if getattr(cfg, "oracle_shared_event", False):
+            shared_event = (seed_narrowed, wall_narrowed, wall_seed_xy_narrowed)
         scripted = simple_oracle.simple_oracle_motors(worker, arena_ids, locals_, walls, wall_seed_xy, cfg, rng,
                                                       getattr(cfg, "_oracle_formation_pool", None),
-                                                      belief_attr = "simple_belief")
+                                                      belief_attr = "simple_belief",
+                                                      shared_event = shared_event)
     else:
         scripted = scripted_motors(node_b, cfg.motor_override, cfg.force_motor, assigned_dir = assigned_dir,
                                    stopped_mask = stopped_mask, belief_heading = belief_heading)

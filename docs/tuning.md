@@ -10815,3 +10815,161 @@ case phase 160 already measured for `navigating`, where the assignment is
 well-defined. The gate latching is what makes false positives irreversible;
 `arrived_release_threshold` (phase 156) is the hysteresis escape hatch, kept at
 0.5 in the eval runs as the pipeline already used.
+
+## 2026-10-08 (phase 162): the BC capture draws the tick's observation event TWICE -- measured, and it is material
+
+While asking why the clone cannot replicate the oracle tick-for-tick, a
+structural inconsistency surfaced in the BC capture path. `act()` gathers the
+actor's inputs through `sample_split_event` (observation.py:529), whose
+single-winner draw encodes THE one event a one-receiver Kilobot heard this tick
+into `tc`. `simple_oracle_motors` then runs ITS OWN `sample_split_event` call
+(simple_oracle.py:184) over a wall-only pool, and the oracle's belief fusion
+and wall steering consume THAT draw's winner. Two independent draws of the same
+tick's single physical reception: when they disagree, the (input, label) pair
+is inconsistent -- the label was computed from an event the input does not
+encode. On hardware there is one receiver; there is one ground-truth event.
+
+### Tape decode (upper bound)
+
+`tools/audit_event_draw.py tape` decodes the event encoded in each tape entry's
+tc and cross-tabulates against the oracle state. On `tape_train.pt` (3.04M
+decisions) + `fixed_dagger_1a.pt` (1.43M): 35.1% of wall-handling decisions
+(turning + wall_following, 1.50M) have a tc whose winning event is NOT a wall
+(64.9% wall in wall_following, 75.8% in turning; go_north 0.3%, navigating
+21.0%). That class mixes true quiet-wall ticks with draw divergence -- the
+live audit separates them.
+
+### Live twin audit (the decisive measurement)
+
+`tools/audit_event_draw.py live` runs the ordinary oracle-driven bc_capture
+rollout and, inside the oracle call (before `act()` updates
+`worker.last_dec_step` -- the ordering record_tape's comment warns about; the
+first harness version violated it and produced garbage, caught by the control
+arm), runs TWO additional separately-stateful oracle lines on the same executed
+motion: a CONTROL consuming the oracle's own draw, and a TREATMENT consuming
+the actor's narrowed event (the unified convention). The control reproduces
+the real oracle to <= 0.0001 label change / <= 0.0005 state divergence --
+the oracle is deterministic given its event stream (HEADING_NOISE_SCALE=0), so
+the harness is sound. 1536 ticks, 2 arenas, 54,403 decisions:
+
+| state | n | P(draws disagree) | P(label changes) | P(chg \| disagree) | P(state line diverges) |
+|---|---|---|---|---|---|
+| go_north | 20559 | 0.927 | 0.000 | 0.000 | 0.000 |
+| turning | 1907 | 0.217 | 0.033 | 0.114 | 0.033 |
+| wall_following | 29997 | 0.191 | 0.073 | 0.183 | 0.073 |
+| navigating | 1940 | 0.606 | 0.223 | 0.221 | 0.007 |
+| **overall** | 54403 | **0.485** | **0.049** | 0.051 | 0.042 |
+
+Readings:
+
+1. **Half of all ticks the two draws disagree** (92.7% in go_north, where the
+   input tc almost never shows a wall but the oracle's wall-only pool almost
+   always awards it the strongest wall anyway).
+2. **~5% of ALL training labels would change under a unified draw** --
+   concentrated exactly where the clone is weakest: 7.3% of wall_following,
+   **22.3% of navigating** labels (that is the state whose within-tolerance is
+   20%, phase 160). The DAgger shadow labels carry the same inconsistency.
+3. **Naive unification weakens the oracle itself.** The oracle's filter is
+   wall-ONLY -- `seed_obs` is hard-zeroed (simple_oracle.py:313), it never
+   fuses seed beacons -- so its localization lives off fusing a wall band on
+   nearly every tick, which the one-event regime forbids. Deprived of that,
+   the treatment line diverges progressively (state-line divergence by decile:
+   ~0 early, 6-11% late): the unified oracle is a meaningfully weaker
+   localizer than the current one.
+
+### Consequence
+
+The double draw is material and worth fixing, but only as a package: unify the
+event (one draw, oracle consumes it) AND give the oracle's filter the fusion
+opportunities the shared event actually contains -- above all seed beacons,
+which its filter currently structurally ignores while the actor's own filter
+fuses them. That makes the oracle a true single-event physical agent instead
+of an over-informed one, at the price of: an oracle change (the frozen
+constraint), re-recording all tapes, and retraining BC. Until then, treat ~5%
+of tape labels (22% of navigating) as inconsistent pairs, and do not expect
+tick-level command agreement in wall_following/navigating to close below that
+floor under the current data.
+
+### Phase 162 implemented (2026-10-08): the shared-event package, behind two flags
+
+- `config.oracle_shared_event` (default ON): one observation event per tick. In
+  bc_capture the oracle consumes the actor pipeline's already-narrowed event
+  (passed as `simple_oracle_motors(..., shared_event=...)`, which skips its
+  internal draw); act() also stashes it on `worker._last_shared_event` for the
+  DAgger shadow. In oracle-only modes (watch, `eval_closed_loop --mode oracle`)
+  nothing else consumes the tick, so the oracle draws once itself -- now from
+  the FULL physical pool (seeds + walls + neighbours) instead of the legacy
+  wall-only dummies. In DAgger (record_tape's shadow labeller) the shadow runs
+  AFTER act() to see the shared event, with per-robot pre-act odometry restored
+  around the call -- the same snapshot/restore machinery the audit twin used
+  and validated bit-exact; legacy ordering preserved when the flag is off.
+- `config.oracle_fuse_seeds` (default ON): the oracle's filter fuses the
+  event's seed observation (range to the known-position beacons), the same
+  fusion the actor's filter performs, replacing the hard-zeroed seed_obs. This
+  is the compensation that keeps localization strong once the wall-only draw's
+  ~93%-of-ticks fusion crutch is gone.
+- Env wiring: `KILOBOT_ORACLE_SHARED_EVENT` / `KILOBOT_ORACLE_FUSE_SEEDS`
+  (launch.py), so the old convention stays reachable for A/B runs.
+- Wrapper signature fixed to forward `**kw` (census wrapper in
+  run_bc_monitored, expert-noise wrapper in record_tape, the audit tool's);
+  eval_closed_loop's own wrappers already forwarded. The monitored driver's
+  diagnostic shadow keeps its pre-act ordering but now self-draws from the
+  full pool under the flag (it is a state census, not a label source).
+- Suite: 269 tests pass. Smoke: the new oracle's coverage/stopped curve at
+  tick 2000 matches the old oracle's (0.120/0.024 vs 0.110/0.023) on the eval
+  harness; the full 10-arena, 10k-tick baseline re-run is the acceptance gate
+  before any tape re-recording.
+- Environment repair found during the smoke: `results/` held 4255 symlinks
+  (val_formations pools, single_shape) pointing at the pre-move absolute path
+  `/home/moshe/Projects/Kilobot-GNN/...` -- the project now lives under
+  `/home/moshe/Personal/Projects/`. All rewritten as repo-relative links into
+  `data/formations/`; zero broken links remain. This is also why any eval
+  would have failed on a fresh run before the repair.
+
+## 2026-10-08 (phase 163): new-convention tapes + fit + closed loop -- the label fix holds end to end
+
+Old-convention data purged (~14.5 GB); tapes re-recorded under
+`oracle_shared_event` (same protocol, seeds and pools as the pipeline's tape
+stage): `tape_train.pt` 3,162,811 decisions / `tape_val.pt` 1,397,513, state
+mix matching the old tapes, every (input, label) pair consistent by
+construction. New-oracle acceptance gate first: closed-loop baseline
+0.633 coverage / 99.6% stopped / 0.376 settled<5u / 13.8u median err
+(`results/audit_event_draw/oracle_new_10.json`) -- a match of the old oracle's
+0.629 / 99.6% / 0.375 / 12.6u, so the teacher survived the change.
+
+BC fit (`results/bc_v2/run_r0/`, o3's config, selected on steering, 24,498
+params = 23.9 KB int8): held-out replay -- balanced MSE 0.0035 (o3 0.0069),
+within-0.05 0.879 (0.841), steering RMS 0.0176 (0.0497), arrived F1 0.9984
+(0.995), **navigating within-tolerance 0.357 (0.200)** -- the exact state the
+~22%-label-inconsistency lived in, +78% relative. All 25 replay metrics
+improved; none regressed.
+
+Closed loop, head-only (no gate), fixed 10-arena/10k-tick harness
+(`results/bc_v2/eval_r0_head.json`): **coverage 0.743** (peak 0.745), stopped
+**94.5%**, settled<5u **0.516**, settled<10u 0.779, settled<20u **0.880**,
+median err ~5.1u. Reference rows on the same harness: new-oracle 0.633 /
+99.6% / 0.376 / 13.8u; old o3 head-only 0.646 / 77.4% / 0.281 / 0.674<20u /
+7.3u; old o3 hybrid gate 0.706 / 85.6% / 0.428 / 0.743<20u / 5.9u. The new
+clone's PLAIN HEAD beats the old clone's best gate-tuned variant and the
+oracle itself on coverage, every settle tolerance and error, and nearly closes
+the stop-rate gap (94.5% vs 99.6%) without any gate. Next: GUI verification
+(multi-arena, recorded), then DAgger rounds and gate re-derivation on the new
+clone if still warranted.
+
+### Phase 163 addendum: the GUI's corner clustering was a real, pre-existing wiring gap -- launch.py's eval path never built the formation pool
+
+The user's multi-arena GUI watch showed go_north and wall_following perfect but
+navigating collapsing into corner clusters, contradicting the eval numbers.
+Both were telling the truth about their own paths: `observation.py`'s KNOWN GAP
+(:435) degrades every robot's target-relative prop to zeros
+(has_target=False) when `cfg._oracle_formation_pool` is absent, and
+`launch.py`'s eval path (`run_eval`) was one of the entry points that never
+built it (only the parallel-RL and BC paths did). go_north and wall_following
+need no target; navigating steers by the target bearing, and the policy has
+never seen a zero-target navigating input in training (every tape row has a
+real one), so its response is arbitrary -- the corner clustering.
+`watch_actor.sh` has therefore been showing a target-starved policy all along,
+while `eval_closed_loop` (which builds the pool for its settled metric) measured
+the correctly-wired one. Fixed: launch.py's eval path now builds the pool for
+the split actor (guarded, prints when it fires); verified end to end headless
+(pool built, checkpoint loads, eval loop runs). The GUI command is unchanged.

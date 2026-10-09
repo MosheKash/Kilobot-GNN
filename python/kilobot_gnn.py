@@ -617,7 +617,16 @@ def oracle_form_motor(actor, g, prop_b):
     # common half cannot change the differential at all, which is the exact half
     # of the property.
     if actor.oracle_residual > 0 or actor.oracle_residual_turn > 0:
-        res = torch.tanh(actor.head_motor(g))
+        # The residual head opens `head_hidden + 2` wide when the steering
+        # feature is on, so it needs the wall-gated (tangent - heading) pair
+        # even though the closed-form steering above already reads it -- both
+        # `pw` and the candidate pairs are in scope from the oracle-form mix.
+        if actor.use_steer_feature:
+            res_in = torch.cat([g, (pw * cand_sin).sum(dim = -1, keepdim = True),
+                                (pw * cand_cos).sum(dim = -1, keepdim = True)], dim = -1)
+        else:
+            res_in = g
+        res = torch.tanh(actor.head_motor(res_in))
         common = actor.oracle_residual * res[..., 0:1]
         diff = actor.oracle_residual_turn * res[..., 1:2]
         motor = motor + torch.cat([common - diff, common + diff], dim = -1)

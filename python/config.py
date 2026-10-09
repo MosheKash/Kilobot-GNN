@@ -227,6 +227,29 @@ class Config:
     # long as the actual spawn heading physically matches belief.KNOWN_START_HEADING
     # everywhere this runs -- it is a setup convention, not a per-tick readout.
     oracle_known_start_heading: bool = False
+    # One observation event per tick (docs/tuning.md phase 162). A Kilobot has
+    # one IR receiver, so the tick has ONE ground-truth event; historically the
+    # BC capture drew it twice -- the actor pipeline's draw (which becomes the
+    # tape's stored tc) and a second, wall-only draw inside simple_oracle (which
+    # decided what the oracle's belief fused and steered from). Measured: the
+    # two draws disagree on 48.5% of ticks and ~5% of training labels (22.3% of
+    # navigating) were computed from an event the input does not encode. On:
+    # the oracle consumes the actor pipeline's draw in bc_capture/DAgger paths,
+    # and in oracle-only modes (watch) it draws once itself from the FULL pool
+    # (seeds + walls + neighbours) instead of a wall-only one. The filter
+    # instances stay separate -- only the observation is shared, because it is
+    # the same physical radio reception.
+    oracle_shared_event: bool = True
+    # The oracle's particle filter fuses the event's seed observation (range to
+    # the known-position corner beacons) exactly as the actor's own filter does.
+    # simple_oracle's filter was wall-only by construction (seed_obs hard-zeroed),
+    # which only worked because its private draw awarded it the strongest wall on
+    # ~93% of ticks -- more reception than the one-receiver model allows. Under
+    # oracle_shared_event that crutch disappears; seed fusion is the compensation
+    # that keeps the oracle a strong localizer while making it an honest
+    # single-event physical agent. Turning this off with oracle_shared_event on
+    # measurably degrades the oracle (twin audit, phase 162).
+    oracle_fuse_seeds: bool = True
 
     # ─── behaviour cloning ───────────────────────────────────────────────────
     # Force a random fraction of decisions to see h_prev=0, during oracle-driven
@@ -344,6 +367,11 @@ class Config:
     # superset of the two alone. The latch is terminal either way, like the
     # oracle's arrived state.
     closed_form_hybrid: bool = False
+    # With use_closed_form_arrived, run the closed-form rule in AND with the
+    # learned arrived head: stop only when BOTH branches agree the robot is
+    # done. This is the anti-oracle of closed_form_hybrid -- it stops nobody
+    # the two disagree about, trading stopping rate for stopping confidence.
+    closed_form_and_gate: bool = False
     # Whether a switched-off robot's GRU hidden state stops advancing. True is
     # the original behaviour (phase 142): with nothing having trained the
     # network on the long arrived stretches, letting the recurrence run over

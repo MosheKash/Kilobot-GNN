@@ -206,6 +206,15 @@ def make_env(worker_id):
         # reproducible network init and a reproducible arena are separate
         # requests, and the player would silently pick up the former.
         os.environ["KILOBOT_SWARM_RNG"] = str(SWARM_RNG + worker_id)
+    # The Unity player must load the SAME formations folder Python's image
+    # pool / formation pool were built from, or its baked distance field
+    # (node[:, 4]) and on-pixel targets never match the actor's observation.
+    # eval_closed_loop.py does this via unity_env.set_player_env; launch.py's
+    # RL path never did, so the player fell back to the build's default
+    # Resources/Formations (which doesn't exist) and coverage was pinned at 0.
+    # Set it here, before the player inherits the environment at startup.
+    if FORMATIONS_DIR:
+        os.environ["KILOBOT_FORMATIONS"] = os.path.abspath(FORMATIONS_DIR)
     critic_channel = CriticChannel()
     params_channel = EnvironmentParametersChannel()
     engine_channel = EngineConfigurationChannel()
@@ -310,6 +319,20 @@ def run_eval(cfg):
         # cached, so this reuses build_image_pool's own call above rather
         # than re-scanning the folder.
         image_names = [os.path.basename(p) for p in formation_paths(FORMATIONS_DIR, limit=MAX_FORMATIONS)]
+
+        # The split-observation actor navigates by the target-relative columns
+        # of its own proprioception, resolved through cfg._oracle_formation_pool
+        # (observation.py's KNOWN GAP). Without the pool here, EVERY robot's
+        # has_target degrades to False and the prop target vector goes to zeros
+        # -- an input the policy never saw in training -- so go_north and
+        # wall_following still look perfect but navigating steers garbage
+        # (measured as corner clustering in the GUI, phase 163). The RL paths
+        # build this pool; the eval path must too.
+        if cfg.actor_type == "gru_split_observation" and not hasattr(cfg, "_oracle_formation_pool"):
+            from formations import build_formation_pool
+            cfg._oracle_formation_pool = build_formation_pool(FORMATIONS_DIR, limit=MAX_FORMATIONS)
+            print("formation pool built (%d formations) for split-observation target assignment"
+                  % len(cfg._oracle_formation_pool))
 
         actor = build_actor(cfg).to(device)
         policy = GaussianPolicy(actor, cfg.log_std_init).to(device)
@@ -485,6 +508,8 @@ def main():
                                               getattr(cfg, "closed_form_arrival_dist", 0.0))
     cfg.closed_form_hybrid = _env_bool("KILOBOT_CLOSED_FORM_HYBRID",
                                        getattr(cfg, "closed_form_hybrid", False))
+    cfg.closed_form_and_gate = _env_bool("KILOBOT_CLOSED_FORM_AND",
+                                         getattr(cfg, "closed_form_and_gate", False))
     # The three auxiliary heads (arrived, state, wall) plus the oracle head and
     # steer feature. Same direct bug the two flags above fixed: build_actor(cfg)
     # here has no access to what a checkpoint was trained with, and load_for_eval
@@ -565,6 +590,8 @@ def main():
         raise SystemExit("KILOBOT_ARRIVED_RELEASE_THRESHOLD must be strictly below "
                          "KILOBOT_ARRIVED_CONFIDENCE_THRESHOLD (it is a hysteresis floor)")
     cfg.oracle_known_start_heading = _env_bool("KILOBOT_ORACLE_KNOWN_START_HEADING", cfg.oracle_known_start_heading)
+    cfg.oracle_shared_event = _env_bool("KILOBOT_ORACLE_SHARED_EVENT", cfg.oracle_shared_event)
+    cfg.oracle_fuse_seeds = _env_bool("KILOBOT_ORACLE_FUSE_SEEDS", cfg.oracle_fuse_seeds)
     cfg.oracle_orbit_axis_trust_threshold = _env_float("KILOBOT_ORACLE_ORBIT_AXIS_TRUST_THRESHOLD", cfg.oracle_orbit_axis_trust_threshold)
     cfg.oracle_send_visual_state = _env_bool("KILOBOT_ORACLE_SEND_VISUAL_STATE", cfg.oracle_send_visual_state)
     cfg.oracle_debug_wall_log = _env_bool("KILOBOT_ORACLE_DEBUG_WALL_LOG", cfg.oracle_debug_wall_log)
@@ -608,6 +635,16 @@ def main():
             from checkpoint import load_for_eval
             load_for_eval(INIT_ACTOR, policy, cfg.device)
             print("warm-started actor from %s" % INIT_ACTOR)
+        # The split-observation actor needs cfg._oracle_formation_pool for the
+        # workers' target assignment (observation.py's KNOWN GAP). Built here,
+        # in the parallel path, because this branch returns before the
+        # non-parallel block that builds it -- without it every robot gets
+        # has_target=False and RL coverage stays pinned at 0.
+        if cfg.actor_type == "gru_split_observation":
+            from formations import build_formation_pool
+            cfg._oracle_formation_pool = build_formation_pool(FORMATIONS_DIR, limit=MAX_FORMATIONS)
+            print("formation pool built (%d formations) for split-observation target assignment"
+                  % len(cfg._oracle_formation_pool))
         run_dir = os.path.join(LOGDIR, time.strftime("run_%Y%m%d_%H%M%S"))
         logger = Logger(run_dir)
         print("to view metrics: tensorboard --logdir", LOGDIR)
@@ -663,13 +700,22 @@ def main():
         # never true. A real Unity BC run crashed on exactly that:
         # "object of type 'NoneType' has no len()" from ensure_target, because
         # simple_oracle_motors got formation_pool=None.
-        if cfg.motor_override == "simple_oracle" or (MODE == "bc" and BC_TEACHER == "simple_oracle"):
+        # The split-observation actor ALSO needs the formation pool: ensure_target
+        # resolves each robot's assigned target point (observation.py's PROP_SIN_T/
+        # PROP_COS_T / d_target) from it, and without it the RL fine-tune got
+        # has_target=False for every robot -> coverage pinned at 0 (the KNOWN GAP
+        # comment in observation.py). So build it for the split actor in every
+        # mode, not just oracle/BC.
+        need_pool = (cfg.motor_override == "simple_oracle"
+                     or (MODE == "bc" and BC_TEACHER == "simple_oracle")
+                     or cfg.actor_type == "gru_split_observation")
+        if need_pool:
             from formations import build_formation_pool
             formation_pool = build_formation_pool(FORMATIONS_DIR, limit=MAX_FORMATIONS)
             assert len(formation_pool) == len(pool), \
                 "formation pool and image pool length mismatch -- should never happen, both built from images.formation_paths"
             cfg._oracle_formation_pool = formation_pool
-            print("simple_oracle formation pool built (%d formations) -- see simple_oracle.py's own module docstring"
+            print("formation pool built (%d formations) for split-observation/oracle target assignment"
                   % len(formation_pool))
 
         actor = build_actor(cfg).to(cfg.device)

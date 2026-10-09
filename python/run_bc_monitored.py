@@ -930,8 +930,8 @@ def main():
     state_ticks = {s: 0 for s in state_names}
     state_total = [0]
     orig_oracle_motors = SO.simple_oracle_motors
-    def census_oracle_motors(worker, arena_ids, locals_, walls, wall_seed_xy, cfg, rng, formation_pool, belief_attr = "belief"):
-        result = orig_oracle_motors(worker, arena_ids, locals_, walls, wall_seed_xy, cfg, rng, formation_pool, belief_attr = belief_attr)
+    def census_oracle_motors(worker, arena_ids, locals_, walls, wall_seed_xy, cfg, rng, formation_pool, belief_attr = "belief", **kw):
+        result = orig_oracle_motors(worker, arena_ids, locals_, walls, wall_seed_xy, cfg, rng, formation_pool, belief_attr = belief_attr, **kw)
         for states_in_arena in worker.simple_state.values():
             for s in states_in_arena.values():
                 if s in state_ticks:
@@ -999,12 +999,25 @@ def main():
         # actor_io.act's own bc_capture path calls the oracle before the same
         # update, for the same reason.
         if cfg.motor_override == "none" and len(decision_steps) > 0:
-            vector, _ = actor_io.split_obs(decision_steps.obs, cfg.device)
+            vector, rows = actor_io.split_obs(decision_steps.obs, cfg.device)
             arena_ids = vector[:, 0].long()
             locals_ = vector[:, 1].long()
             walls = vector[:, 2 + SEED_SIZE:2 + SEED_SIZE + WALL_SIZE]
+            # Under cfg.oracle_shared_event the shadow is a physical one-receiver
+            # agent too: its own draw spans the full pool (seeds + walls +
+            # neighbours) and its filter fuses the event's seed observation, the
+            # same regime the oracle-driven BC path labels under. It still draws
+            # its own event rather than consuming the actor's: it runs BEFORE
+            # act() (ordering load-bearing, see below) and is a diagnostic state
+            # line, not a label source -- the one event it may disagree with the
+            # actor's draw on is second-order for a belief-state census.
+            seeds_shadow = vector[:, 2:2 + SEED_SIZE]
+            rows_shadow, _ = actor_io._extract_wall_seed_rows(rows, cfg.device)
+            valid_shadow = rows_shadow.abs().sum(dim = 2) > 0
             orig_oracle_motors(worker, arena_ids, locals_, walls, None, cfg, rng,
-                              getattr(cfg, "_oracle_formation_pool", None), belief_attr = "actor_shadow_belief")
+                               getattr(cfg, "_oracle_formation_pool", None),
+                               belief_attr = "actor_shadow_belief",
+                               seeds = seeds_shadow, rows = rows_shadow, valid = valid_shadow)
         result = orig_act(buffer, policy, worker, decision_steps, cfg, rng, deterministic = deterministic,
                           bc_capture = bc_capture, probe = probe, probe_log = probe_log, audit = audit,
                           audit_log = audit_log, pos_track = pos_track, pos_log = pos_log)
