@@ -63,3 +63,5 @@ tree.txt
 kilobot-gnn/
 kilobot-gnn.zip
 paper/
+.graphifyignore
+.opencode/

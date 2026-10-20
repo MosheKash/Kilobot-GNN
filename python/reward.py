@@ -95,6 +95,203 @@ def coverage(node, cfg):
     return on_image.float().mean()
 
 
+def separation_reward(node, cfg):
+    # The anti-clumping term alone, times dt -- the one piece of the base
+    # shape reward that reward_mode="target" keeps. Extracted from _terms so
+    # the target-mode path and the coverage-mode path share one definition
+    # instead of drifting apart.
+    crowding = torch.clamp(cfg.tau_sep - node[:, NEAREST_COL], min=0.0)
+    return (-cfg.k_sep * crowding / cfg.tau_sep) * cfg.dt_fixed
+
+
+def target_kernel(dists, sigma):
+    # Gaussian kernel over normalized own-target distance: 1.0 at the pixel,
+    # exp(-1) at one sigma, effectively zero beyond ~3 sigma. This is the
+    # accuracy shape the task metric itself has: the settle report counts
+    # within-5/10/20-unit bands, and phase 159 measured the per-robot error
+    # distribution as a spike inside 5 units with an unrelated flat tail --
+    # what deserves reward is the spike, not the tail.
+    return torch.exp(-(dists / sigma) ** 2)
+
+
+def accuracy_income(dists, valid, weight, sigma, dt):
+    # Per-step income for being at the robot's OWN assigned pixel (mode
+    # "target"). Localization is rewarded instrumentally: a robot that has
+    # not figured out where it is cannot find the pixel, so no separate
+    # confidence bonus is needed (and phase 2/9's measured lesson was that
+    # paying for confidence directly makes a confidently-wrong cloud
+    # profitable). Zero where the target is unresolvable -- never NaN into
+    # the reward.
+    inc = torch.where(valid, target_kernel(dists, sigma), torch.zeros_like(dists))
+    return weight * inc * dt
+
+
+def settled_potential(dists, valid, sigma):
+    # The shared arena potential behind global_shaping, SMOOTH: the mean
+    # kernel over robots with resolvable targets. A threshold (fraction
+    # within a radius) is flat almost everywhere -- it only moves at the
+    # exact tick a robot crosses the bar, so a sender whose message improves
+    # a neighbour from 12 to 6 units would earn nothing. The kernel has
+    # gradient at every distance, which is what gives broadcast actions a
+    # usable learning signal (docs/tuning.md phase 165).
+    if not bool(valid.any()):
+        return 0.0
+    k = target_kernel(dists[valid], sigma)
+    return float(k.mean())
+
+
+def belief_errors(worker, k, node):
+    """Per-robot distance between the belief filter's mean position and truth.
+
+    e_i = |mean(particles_i)[:, 0:2] - node_i[:, 0:2]| in normalized units.
+    Privileged like every reward quantity (the actor's observation never
+    contains its true position); what it measures is localization
+    CORRECTNESS, not self-reported confidence -- a confidently wrong cloud
+    keeps e large and earns nothing, which is the property phases 2/9
+    demanded after the conf bonus was measured to reward wrong convergence.
+
+    Returns a float tensor of per-robot errors, NaN for robots with no
+    belief entry yet (no gradient for them, never treated as zero).
+    """
+    m = node.shape[0]
+    out = torch.full((m,), float("nan"), device=node.device)
+    bel = (worker.belief.get(k, {}) if hasattr(worker, "belief") else None)
+    if not bel:
+        return out
+    idx = [l for l in bel if l < m]
+    if not idx:
+        return out
+    parts = torch.stack([bel[l] for l in idx]).to(node.device)
+    mean_xy = parts[:, :, 0:2].mean(dim=1)
+    true_xy = node[torch.tensor(idx, dtype=torch.long, device=node.device), 0:2]
+    out[torch.tensor(idx, dtype=torch.long, device=node.device)] = (mean_xy - true_xy).norm(dim=1)
+    return out
+
+
+def honest_confidences(worker, k, node):
+    """Per-robot honest beacon confidence: conf_pos * r over own particles.
+
+    Exactly what actor_io's honest-beacon override would broadcast (and what
+    message supervision targets) -- conf_pos from the position spread, r the
+    heading concentration (identically ~1 under the zero-heading-noise
+    filter, but computed rather than assumed). NaN for robots with no
+    belief entry yet; callers must treat NaN as no term, never zero.
+    """
+    m = node.shape[0]
+    out = torch.full((m,), float("nan"), device=node.device)
+    bel = (worker.belief.get(k, {}) if hasattr(worker, "belief") else None)
+    if not bel:
+        return out
+    idx = [l for l in bel if l < m]
+    if not idx:
+        return out
+    parts = torch.stack([bel[l] for l in idx]).to(node.device)
+    mx = parts[:, :, 0].mean(dim=1)
+    my = parts[:, :, 1].mean(dim=1)
+    var = ((parts[:, :, 0] - mx.unsqueeze(1)) ** 2).mean(dim=1) + \
+          ((parts[:, :, 1] - my.unsqueeze(1)) ** 2).mean(dim=1)
+    sin_m = torch.sin(parts[:, :, 2]).mean(dim=1)
+    cos_m = torch.cos(parts[:, :, 2]).mean(dim=1)
+    r = torch.sqrt(sin_m * sin_m + cos_m * cos_m)
+    out[torch.tensor(idx, dtype=torch.long, device=node.device)] = torch.exp(-var / 0.02) * r
+    return out
+
+
+def beacon_overclaim_penalty(node, honest, weight, dt):
+    """Charged per tick while a robot's BROADCAST conf exceeds its own honest
+    filter confidence: -weight * relu(claimed - honest) * dt.
+
+    Why a reward term rather than supervision: the measured failure mode of
+    the first transmission run. PPO pushed the learned conf gate to 2.4x the
+    honest rate (24% of decisions broadcasting past PEER_CONF_MIN against an
+    honest 10%), and 14% of beacons were OVERCONFIDENT -- sent by robots
+    whose own filter had not localized, so their position claims were ~50
+    units wrong while claiming conf ~0.9. The receiver's fusion picks the
+    MOST confident valid row (argmax), so the liar always wins the slot, and
+    the resulting wrong range-rings are what dropped the with-comms eval 0.18
+    below the no-comms one. Action-space supervision cannot hold the slot
+    down: its gradient vanishes at tanh saturation (tanh'(2.0) ~ 0.02)
+    exactly where the conf sits, while PPO's advantage gradient does not --
+    so the honesty constraint has to ride the same advantage channel. The
+    claimed value is read from node's transmission column (slot 2), the
+    honest one from the sender's own particles; both are privileged to the
+    reward, invisible to the actor.
+    """
+    m = node.shape[0]
+    out = torch.zeros(m, device=node.device)
+    if honest is None or weight <= 0.0:
+        return out
+    valid = ~torch.isnan(honest)
+    if not bool(valid.any()):
+        return out
+    claimed = node[:, 12]
+    over = (claimed - honest).clamp(min=0.0)
+    out = -weight * torch.where(valid, over, torch.zeros_like(over)) * dt
+    return out
+
+
+def arena_potential(dists, valid_t, errs, valid_e, cfg):
+    """The shared arena potential for sender credit, in two bands.
+
+    pot = mean_i kernel(d_i, sigma_g) + w_e * mean_i kernel(e_i, sigma_e),
+    each band over the robots where that quantity is defined. The settled
+    band is the phase-165 kernel and alone it is structurally blind to the
+    one improvement messaging produces: the accuracy kernel (sigma 0.05) is
+    exp(-1) at one sigma and ~0 beyond three, so a robot at 50 units from
+    its pixel moves it by nothing, and the whole first ~3000 ticks of the
+    settle curve -- the localization phase a helpful beacon actually speeds
+    up -- pay a sender exactly zero (phase 163's curve: settled<5u is 0.016
+    at tick 2000, 0.63 at 8000). The belief-error band fixes that: e shrinks
+    from the first landmark fix onward, including mid-arena, and shrinks
+    FURTHER when a receiver fuses a true peer beacon -- while a garbage
+    broadcast with high conf grows e and drops the potential, which is the
+    gradient that makes honesty the profitable protocol.
+    """
+    pot = 0.0
+    if valid_t is not None and bool(valid_t.any()):
+        pot = pot + float(target_kernel(dists[valid_t], cfg.global_potential_sigma).mean())
+    w_e = float(getattr(cfg, "belief_potential_weight", 1.0))
+    if w_e > 0.0 and errs is not None:
+        e_valid = ~torch.isnan(errs) if valid_e is None else valid_e
+        if bool(e_valid.any()):
+            pot = pot + w_e * float(target_kernel(
+                torch.where(e_valid, errs, torch.zeros_like(errs))[e_valid],
+                getattr(cfg, "belief_potential_sigma", 0.20)).mean())
+    return pot
+
+
+def assigned_target_dists(worker, k, node, cfg):
+    """Per-robot normalized distance to its OWN assigned target point.
+
+    The RL fine-tune's reward geometry (docs/tuning.md phase 164): what the
+    settle metric scores is distance to the point observation.ensure_target
+    assigned this robot, so that is what the reward should shape. Resolved
+    through the same shared ensure_target cache the actor's target-relative
+    proprioception uses, so reward and observation can never disagree about
+    which point a robot was sent to. Positions come from the privileged
+    critic snapshot (node[:, 0:2], normalized) -- legitimate here, rewards
+    are allowed privileged information, and the actor never sees this value
+    except through the return.
+
+    Returns a float tensor of normalized distances, NaN for robots with no
+    resolvable target (no formation pool, or the arena's image_id unknown) --
+    callers must treat NaN as "no gradient for this robot", never as zero.
+    """
+    pool = getattr(cfg, "_oracle_formation_pool", None)
+    image_id = worker.image_id.get(k)
+    m = node.shape[0]
+    out = torch.full((m,), float("nan"))
+    if not pool or image_id is None:
+        return out
+    from observation import ensure_target
+    from belief import ARENA_HALF
+    pos = node[:, 0:2] * ARENA_HALF
+    for l in range(m):
+        tgt = ensure_target(worker, k, l, image_id, pool)
+        out[l] = float((pos[l] - tgt).norm()) / ARENA_HALF
+    return out
+
+
 def belief_confidence_bonus(node, belief, bonus_weight):
     # Localization scaffolding for the split actor: pay bonus_weight * conf_pos per
     # step for holding a collapsed pose belief, so visiting beacons becomes rewarding

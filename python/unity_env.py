@@ -35,6 +35,41 @@ from env_worker import EnvWorker
 from policy import ACTION_SIZE
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _widen_grpc_message_cap(n_bytes = 64 * 1024 * 1024):
+    """Raise the message-length caps on every grpc server this process builds.
+
+    grpc server channels default to a 4 MiB max message length, and
+    Unity->python observation batches scale with agents*arenas at ~4.3 KB per
+    agent: 480 agents exchange ~2.0 MB, 1200 agents (600 bots x 2 arenas)
+    exchange ~5.1 MB. mlagents_envs runs the grpc *server* on the python side
+    (rpc_communicator.create_server) and exposes no option for the channel, so
+    past ~1000 agents per exchange Unity's client is rejected with
+    ResourceExhausted, logs "GRPC Exception ... Disconnecting from trainer" in
+    its own player log, and exits 0 -- which python surfaces as "Environment
+    shut down with return code 0" during the first reset. The density ladder's
+    N=600 cells die exactly there.
+
+    mlagents_envs sets no channel option beyond so_reuseport, so wrapping
+    grpc.server before the first worker is made is the whole fix. Applied at
+    import time so every tool and test in this process gets it for free; no
+    observation content changes, only the transport stops refusing them.
+    """
+    import grpc
+    _orig_server = grpc.server
+
+    def _server(*args, _orig = _orig_server, _n = n_bytes, **kw):
+        opts = [o for o in (kw.get("options") or []) if isinstance(o, tuple)]
+        opts += [("grpc.max_send_message_length", _n),
+                 ("grpc.max_receive_message_length", _n)]
+        kw["options"] = tuple(opts)
+        return _orig(*args, **kw)
+
+    grpc.server = _server
+
+
+_widen_grpc_message_cap()
 DEFAULT_BUILD_PATH = os.path.join(HERE, "..", "Builds", "Kilobot.x86_64")
 DEFAULT_LOG_DIR = os.path.abspath(os.path.join(HERE, "..", "results", "unity-logs"))
 

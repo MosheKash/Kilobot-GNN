@@ -21,8 +21,9 @@ from belief import (belief_init, belief_predict, belief_update, belief_read, bel
                     ANCHOR_STATE_SIZE, BELIEF_PARTICLES, ARENA_HALF, belief_conf,
                     LOCALIZED_CONF_THRESHOLD, SEED_LAYOUTS, TRIANGULATE_MIN_READINGS,
                     HEADING_NOISE_SCALE, IR_RANGE, WALL_SPACING, _matched_generator)
-from kilobot_gnn import SEED_SIZE, WALL_SIZE, MESSAGE_SIZE, MOTOR_SIZE, DB_ROW_SIZE, DB_CAPACITY, NODE_FEATURES, priv_cols, SPLIT_SEED_OFFSET, SPLIT_WALL_OFFSET
+from kilobot_gnn import SEED_SIZE, WALL_SIZE, MESSAGE_SIZE, MOTOR_SIZE, DB_ROW_SIZE, DB_CAPACITY, NODE_FEATURES, priv_cols, SPLIT_SEED_OFFSET, SPLIT_WALL_OFFSET, PROP_CONF_POS
 from kinematics import dead_reckon, split_tick_motion, split_track_update, split_track_read
+import evidence
 from spatial_hash import hilbert_order, mix_hash, assign_target_index
 
 
@@ -86,6 +87,53 @@ def gather_databases(worker, arena_ids, locals_, device):
             rows[i] = entry[0].to(device)
             valid[i] = entry[1].to(device)
     return rows, valid
+
+
+def hop_flood_update(worker, arena_ids, locals_, rows, valid, strength_col, direct_seed):
+    """Min-relaxation flood update for the hop-count protocol (config.hop_comms).
+
+    Each robot maintains hop_k[s] = its communication-graph distance in IR hops
+    to corner seed s (-1 = unknown). This tick it folds in: direct seed
+    sightings (strength-scaled one-hot direct_seed > 0 makes that seed's hop 0)
+    and every physically-received row whose content slots carry a sender's
+    slot value v >= 1 (slot = sender_k + 1, so the receiver's candidate k is v).
+    The per-seed minima converge to the true graph distance under any flooding;
+    stale rows cannot corrupt the bound (a larger k is still a valid upper
+    bound). Broadcast encoding lives in actor_io (slot = k+1, 0 = silent).
+
+    Mutates worker.hop ({arena: {local: [SEED_SIZE] int}}); returns the same
+    state as a [n, SEED_SIZE] long tensor for belief_update's hop_k argument.
+    """
+    n = arena_ids.shape[0]
+    out = torch.full((n, SEED_SIZE), -1, dtype = torch.long)
+    BIG = 10 ** 9
+    if not hasattr(worker, "hop"):
+        worker.hop = {}
+    for i in range(n):
+        a = int(arena_ids[i]); l = int(locals_[i])
+        cur = worker.hop.get(a, {}).get(l)
+        k1 = [cur[s] if cur is not None and cur[s] >= 0 else BIG for s in range(SEED_SIZE)]
+        ds = direct_seed[i] if direct_seed is not None else None
+        if ds is not None:
+            for s in range(SEED_SIZE):
+                if float(ds[s]) > 0:
+                    k1[s] = 0
+        if rows is not None and valid is not None:
+            r = rows[i]
+            v = valid[i]
+            for c in range(r.shape[0]):
+                if not bool(v[c]) or float(r[c, strength_col]) <= 0:
+                    continue
+                for s in range(SEED_SIZE):
+                    slot_v = float(r[c, s])
+                    if slot_v >= 1 and int(slot_v) < k1[s]:
+                        k1[s] = int(slot_v)
+        for s in range(SEED_SIZE):
+            if k1[s] == BIG:
+                k1[s] = -1
+        worker.hop.setdefault(a, {})[l] = list(k1)
+        out[i, :] = torch.tensor(k1, dtype = torch.long)
+    return out
 
 
 def gather_nodes(worker, arena_ids, locals_, n, device):
@@ -229,6 +277,15 @@ def gather_split_state(worker, arena_ids, locals_, seeds_b, walls_b, cfg, rng, r
                                                      cfg.prop_wheelbase, cfg.dt_fixed)
     track_neighbor = split_track_update(track_neighbor, x_local, y_local, dtheta, t)
     track_seed = split_track_update(track_seed, x_local, y_local, dtheta, t)
+    # evidence_comms: move every stored claim's ring by this tick's own
+    # motion and advance the homing controllers, so stored claims and
+    # reception histories stay live constraints in the receiver's current
+    # odometry frame. Same rotate-then-accumulate semantics as the trackers
+    # above, per claim / per controller (evidence.py).
+    if getattr(cfg, "evidence_comms", False):
+        evidence.propagate_claims(worker, arena_ids, locals_, x_local, y_local, dtheta)
+        evidence.update_homing(worker, arena_ids, locals_, rows, valid, x_local, y_local,
+                               dtheta, cfg, device)
     anchor_batch = belief_track_anchor(anchor_batch, x_local, y_local, dtheta)
     debug_on = getattr(cfg, "oracle_debug_wall_log", False)
     if debug_on:
@@ -332,7 +389,26 @@ def gather_split_state(worker, arena_ids, locals_, seeds_b, walls_b, cfg, rng, r
     peer_pos = None
     peer_conf = None
     peer_strength = None
-    if rows is not None and getattr(cfg, "belief_comms", False):
+    evidence_on = getattr(cfg, "evidence_comms", False)
+    if evidence_on and rows is not None:
+        # The evidence channel consumes the CLAIM STORE, not this tick's
+        # ephemeral rows: claims heard at any earlier tick, propagated
+        # through the receiver's own odometry, are what make cross-encounter
+        # consensus possible. update_claims/update_referrals first (insert
+        # this tick's receptions), then materialize the store as the peer
+        # rows belief.add_peer_fix consumes (the consensus path -- a claim
+        # is never fused alone; see evidence.py).
+        evidence.update_claims(worker, arena_ids, locals_, rows, valid, cfg, device)
+        evidence.update_referrals(worker, arena_ids, locals_, rows, valid, cfg, device)
+        peer_pos, peer_conf, peer_strength = evidence.materialize_claims(
+            worker, arena_ids, locals_, cfg, device)
+        # The second-order veto: a claim survives only when a DISTINCT
+        # sender's claim agrees with it on the receiver's own cloud (the
+        # measured T1a harm was correlated wrong-latch pairs passing the
+        # separation cap; see evidence.consensus_filter).
+        peer_pos, peer_conf, peer_strength = evidence.consensus_filter(
+            peer_pos, peer_conf, peer_strength, particles, cfg)
+    elif rows is not None and getattr(cfg, "belief_comms", False):
         rows_d = rows.to(device)
         peer_pos = rows_d[:, :, 0:2]
         peer_conf = rows_d[:, :, 2].clamp(0.0, 1.0) * valid.to(device)
@@ -340,6 +416,43 @@ def gather_split_state(worker, arena_ids, locals_, seeds_b, walls_b, cfg, rng, r
     ac_pos = ac_conf = ac_valid = ac_strength = None
     if arrived_claim is not None:
         ac_pos, ac_conf, ac_valid, ac_strength = arrived_claim
+    # cfg.peer_fix: the caller-side cooldown bookkeeping for the peer fix
+    # (belief.add_peer_fix / inject_peer_fix). A robot gets a fresh hypothesis
+    # at most once per cooldown window -- the measured defect that had
+    # oracle_arrived_claim_injection churn a cold robot's cloud on nearly
+    # every decision (71% of belief_update calls in one run, real arrivals
+    # 4/24 -> 1/24) until its cooldown existed. peer_injected comes back
+    # mutated: exactly the robots actually injected this tick get stamped.
+    peer_fix = bool(getattr(cfg, "peer_fix", False)) or evidence_on
+    peer_inject_ok = None
+    peer_injected = None
+    if peer_fix and peer_pos is not None:
+        if not hasattr(worker, "_peer_inject_tick"):
+            worker._peer_inject_tick = {}
+        cooldown = int(getattr(cfg, "peer_inject_cooldown_ticks", 400))
+        peer_inject_ok = torch.ones(n, dtype = torch.bool, device = device)
+        for i in range(n):
+            last = worker._peer_inject_tick.get(int(arena_ids[i]), {}).get(int(locals_[i]))
+            if last is not None and (int(worker.step_count.get(int(arena_ids[i]), 0)) - last) < cooldown:
+                peer_inject_ok[i] = False
+        peer_injected = torch.zeros(n, dtype = torch.bool, device = device)
+    peer_trust = None
+    if getattr(cfg, "recv_gate", False) and peer_pos is not None:
+        # The learned receiver's trust gate (config.recv_gate): the robot's
+        # own LAST decision's message slot 3 (post-squash [-1,1]) maps to
+        # g = 0.5*(v+1) in [0,1] and scales this tick's fused-ring sigma by
+        # 1/g. One decision of staleness, same cadence as every other
+        # worker-carried per-robot value; robots with no entry yet default
+        # to 1.0 = the historical ungated receiver.
+        peer_trust = torch.ones(n, device = device)
+        if hasattr(worker, "recv_gate"):
+            for i in range(n):
+                g = worker.recv_gate.get(int(arena_ids[i]), {}).get(int(locals_[i]))
+                if g is not None:
+                    peer_trust[i] = float(g)
+    hop_k = None
+    if rows is not None and getattr(cfg, "hop_comms", False):
+        hop_k = hop_flood_update(worker, arena_ids, locals_, rows, valid, STRENGTH_COL, seeds_b)
     particles = belief_update(particles, seeds_b.to(device), rng,
                               peer_pos = peer_pos, peer_conf = peer_conf, peer_strength = peer_strength,
                               wall_obs = walls_b.to(device),
@@ -348,7 +461,25 @@ def gather_split_state(worker, arena_ids, locals_, seeds_b, walls_b, cfg, rng, r
                               wall_seed_xy = wall_seed_xy.to(device) if wall_seed_xy is not None else None,
                               arrived_claim_pos = ac_pos, arrived_claim_conf = ac_conf,
                               arrived_claim_valid = ac_valid, arrived_claim_strength = ac_strength,
-                              heading_noise_scale = HEADING_NOISE_SCALE if getattr(cfg, "oracle_known_start_heading", False) else None)
+                              heading_noise_scale = HEADING_NOISE_SCALE if getattr(cfg, "oracle_known_start_heading", False) else None,
+                              peer_innovation_min = float(getattr(cfg, "peer_innovation_min", 0.0) or 0.0),
+                              peer_fix = peer_fix, peer_fix_topk = int(getattr(cfg, "peer_fix_topk", 6)),
+                              peer_fix_resid_max = float(getattr(cfg, "peer_fix_resid_max", 1.5)),
+                              peer_inject_min_spread = float(getattr(cfg, "peer_inject_min_spread", 0.2)),
+                              peer_inject_ok = peer_inject_ok, peer_injected = peer_injected,
+                              peer_trust = peer_trust,
+                              hop_k = hop_k)
+    if evidence_on:
+        # The disclosure writer's source of truth: each robot's last DIRECT
+        # sighting, recorded from the same seed/wall channels the filter just
+        # consumed. A record existing IS the anchored condition for
+        # disclosure purposes -- the sighting is the evidence.
+        evidence.record_sightings(worker, arena_ids, locals_, seeds_b.to(device),
+                                  walls_b.to(device), cfg)
+    if peer_injected is not None and bool(peer_injected.any()):
+        for i in torch.nonzero(peer_injected).flatten().tolist():
+            worker._peer_inject_tick.setdefault(int(arena_ids[i]), {})[int(locals_[i])] = \
+                int(worker.step_count.get(int(arena_ids[i]), 0))
     if debug_on:
         post_update_mean = particles[:, :, :2].mean(dim=1).clone()
         post_update_heading = particles[:, :, 2].clone()
@@ -454,6 +585,56 @@ def gather_split_state(worker, arena_ids, locals_, seeds_b, walls_b, cfg, rng, r
     belief_out[:, -3:] = torch.where(has_target.unsqueeze(1), belief_out[:, -3:],
                                      torch.zeros_like(belief_out[:, -3:]))
     prop_b = torch.cat([prop_neighbor, prop_seed, belief_out], dim = 1)
+    # ---- Gate-1 encounter probe (config.encounter_probe; eval tooling only).
+    # Counters only -- reads what is already in scope (the tick's own
+    # reception rows and this robot's fresh belief confidence), fuses
+    # nothing, writes nothing. "Usable" means a peer row whose beacon
+    # content carries conf >= bar, i.e. the sender is broadcasting under the
+    # active writer gate (arrived-only, or anchored+bar): an EVIDENCE HOLDER
+    # was in IR range this tick. The lost/localized split is the
+    # window-matching question: receptions only help a robot that is still
+    # lost when they arrive.
+    if getattr(cfg, "encounter_probe", False) and rows is not None:
+        rec = getattr(worker, "_encounter_probe", None)
+        if rec is None:
+            rec = {}
+            worker._encounter_probe = rec
+        rows_p = rows.to(device)
+        valid_p = valid.to(device) if valid is not None else torch.ones_like(rows_p[:, :, 0], dtype = torch.bool)
+        conf_own = prop_b[:, PROP_CONF_POS]
+        sender_col = rows_p[:, :, MESSAGE_SIZE]
+        content_col = rows_p[:, :, 2]
+        for i in range(n):
+            key = (int(arena_ids[i]), int(locals_[i]))
+            st = rec.get(key)
+            if st is None:
+                st = {"ticks": 0, "lost_ticks": 0,
+                      "peer_ticks": 0, "content_ticks": 0,
+                      "usable_ticks_lost": {0.6: 0, 0.7: 0, 0.8: 0},
+                      "usable_ticks_any": {0.6: 0, 0.7: 0, 0.8: 0},
+                      "first_usable_tick_lost": {0.6: -1, 0.7: -1, 0.8: -1},
+                      "first_localized_tick": -1}
+                rec[key] = st
+            tick = int(worker.step_count.get(int(arena_ids[i]), 0))
+            st["ticks"] += 1
+            lost = bool(float(conf_own[i]) < 0.4)
+            if lost:
+                st["lost_ticks"] += 1
+            elif st["first_localized_tick"] < 0:
+                st["first_localized_tick"] = tick
+            peer = valid_p[i] & (sender_col[i] >= 1.0)
+            if bool(peer.any()):
+                st["peer_ticks"] += 1
+                if bool((content_col[i] * peer > 0.0).any()):
+                    st["content_ticks"] += 1
+                for bar in (0.6, 0.7, 0.8):
+                    usable = peer & (content_col[i] >= bar)
+                    if bool(usable.any()):
+                        st["usable_ticks_any"][bar] += 1
+                        if lost:
+                            st["usable_ticks_lost"][bar] += 1
+                            if st["first_usable_tick_lost"][bar] < 0:
+                                st["first_usable_tick_lost"][bar] = tick
     if getattr(cfg, "use_turn_anchor", False):
         # config.py's own use_turn_anchor has the full rationale. sin_now,
         # cos_now here are belief_out's own columns 2 and 3 exactly --
@@ -508,6 +689,18 @@ def gather_split_state(worker, arena_ids, locals_, seeds_b, walls_b, cfg, rng, r
         sin_rel = sin_now * cos_anchor - cos_now * sin_anchor   # sin(now - anchor)
         cos_rel = cos_now * cos_anchor + sin_now * sin_anchor   # cos(now - anchor)
         prop_b = torch.cat([prop_b, torch.stack([sin_rel, cos_rel], dim = 1)], dim = 1)
+    if getattr(cfg, "homing_proprio", False):
+        # T2's +3 homing proprioception (config.homing_proprio): distance,
+        # sin, cos to the fitted referral beacon, in the robot's current
+        # heading frame -- the nearest-seed trio's exact convention. Zeros
+        # when nothing is fitted, which is how BC tapes record these columns
+        # dark (the warm start stays behaviorally identical; RL activates
+        # the inputs).
+        trio = torch.zeros(n, 3, device = device)
+        for i in range(n):
+            a, l = int(arena_ids[i]), int(locals_[i])
+            trio[i, 0], trio[i, 1], trio[i, 2] = evidence.homing_readout(worker, a, l, cfg)
+        prop_b = torch.cat([prop_b, trio], dim = 1)
     return h_prev, prop_b
 
 
@@ -575,6 +768,20 @@ def sample_split_event(seeds, walls, rows, valid, cfg, rng, wall_seed_xy = None)
     neighbor_content = torch.cat([chosen_rows[:, :MESSAGE_SIZE],
                                   chosen_rows[:, STRENGTH_COL:STRENGTH_COL + 1]], dim = 1)
     actor_part = torch.where(is_neighbor.unsqueeze(1), neighbor_content, torch.zeros_like(neighbor_content))
+    # cfg.tc_peer_zero: a peer row's message content (slots 0-8) is zeroed in
+    # the actor's Tc, keeping only the strength column -- the BC tapes' peer
+    # rows carried zeros there (oracle-driven tapes broadcast no beacon), so
+    # any live beacon content is an input-distribution shift the motor trunk
+    # was never trained on (docs/tuning.md phase 168, driver D). The beacon
+    # still reaches the receiver's belief filter, which is the fusion point;
+    # the senderId column (MESSAGE_SIZE) tells peer rows (>= 1) from wall-seed
+    # rows (negative), whose real landmark positions must stay visible.
+    if getattr(cfg, "tc_peer_zero", False):
+        is_peer_row = chosen_rows[:, MESSAGE_SIZE] > 0
+        zeroed = torch.zeros_like(neighbor_content)
+        zeroed[:, MESSAGE_SIZE:] = neighbor_content[:, MESSAGE_SIZE:]
+        actor_part = torch.where(is_neighbor.unsqueeze(1) & is_peer_row.unsqueeze(1),
+                                 zeroed, actor_part)
 
     tc = torch.cat([actor_part, seed_part, wall_part], dim = 1)
     return tc, seed_part, wall_part, wall_seed_xy_part

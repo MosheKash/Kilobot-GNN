@@ -14,6 +14,7 @@ lives in diagnostics.print_eval_log_summary.
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
+import math
 import time
 import numpy as np
 import torch
@@ -26,10 +27,10 @@ from mlagents_envs.side_channel.engine_configuration_channel import EngineConfig
 from config import Config
 import unity_env
 from channels import CriticChannel
-from trainer import Trainer
+from trainer import Trainer, make_critic
 from env_worker import EnvWorker
 from images import build_image_pool, formation_paths
-from kilobot_gnn import Actor, RecurrentActor, SplitObservationActor, priv_cols, Critic, Z, MESSAGE_SIZE, build_actor
+from kilobot_gnn import Actor, RecurrentActor, SplitObservationActor, priv_cols, Critic, Z, MESSAGE_SIZE, HOMING_PROP_SIZE, build_actor
 from policy import GaussianPolicy, ACTION_SIZE
 from encoder import load_encoder
 from metrics import Logger
@@ -94,6 +95,21 @@ NUM_WORKERS = _env_int("KILOBOT_NUM_WORKERS", 1)
 # spawns unseeded, exactly as every run before this behaved. See make_env for
 # why it is per-worker, and why it is not KILOBOT_SEED.
 SWARM_RNG = _env_opt_int("KILOBOT_SWARM_RNG", None)
+# Swarm size, player-side: SwarmManager reads these from the environment it
+# inherits at startup and falls back to the build's own Inspector values when
+# they are unset (unity_env.py). Before this block they were only ever set by
+# tools/eval_closed_loop.py via unity_env.set_player_env -- a density RL run
+# through launch.py would silently train at whatever the build's default is
+# (56 in the current build), no matter what the operator believed was
+# configured. Both are optional: unset leaves the historical default-INSPECTOR
+# behavior so nothing about an existing 60-robot fine-tune changes, and
+# make_env warns once on worker 0 so the shorthand cannot be missed. The two
+# must agree when both are set because the trainer's target-assignment and
+# the split actor's per-arena robot table are built from the emitted
+# decision_set itself -- an N that shrinks or grows between player and python
+# surfaces as silent coverage corruption, not an error.
+MIN_BOTS = _env_opt_int("KILOBOT_MIN_BOTS", None)
+MAX_BOTS = _env_opt_int("KILOBOT_MAX_BOTS", None)
 TORCH_THREADS = _env_int("KILOBOT_TORCH_THREADS", 1)
 TIMEOUT = _env_int("KILOBOT_TIMEOUT", 600)
 TIME_SCALE = _env_float("KILOBOT_TIME_SCALE", 20.0)
@@ -102,6 +118,21 @@ CKPT_EVERY = _env_int("KILOBOT_CKPT_EVERY", 10)
 RESUME = _env("KILOBOT_RESUME", None)
 MODE = _env("KILOBOT_MODE", "rl")               # "rl" or "bc"
 INIT_ACTOR = _env("KILOBOT_INIT_ACTOR", None)   # warm-start: load actor weights only
+# Quiet message start (docs/tuning.md phase 164): zero the split actor's
+# message head after the warm start loads, and (optionally) overwrite the
+# message dimensions' log-std, so broadcasts start at exactly zero -- the
+# distribution the BC tapes' receivers were trained on -- and exploration of
+# message content grows from there via the entropy bonus rather than starting
+# as random noise that corrupts the warm-started navigation from iteration 0.
+QUIET_MSG_HEAD = _env_bool("KILOBOT_QUIET_MSG_HEAD", False)
+MSG_LOG_STD = _env_float("KILOBOT_MSG_LOG_STD", 0.0)
+# The player's KILOBOT_BAKE_ROTATION_STEPS. Default 0 here, NOT the player's
+# own default of 1: at 1, Unity's baked distance field (node[:, 4], and
+# therefore coverage, on_bonus, off_penalty and the legacy reward_shaping) is
+# formations.py's geometry rotated 90 degrees (docs/tuning.md phase 156).
+# eval_closed_loop.py has always passed 0 for this reason; the RL path must
+# too or it optimizes a different drawing.
+BAKE_ROTATION_STEPS = _env_int("KILOBOT_BAKE_ROTATION_STEPS", 0)
 BC_OUT = _env("KILOBOT_BC_OUT", None)           # where bc mode saves the cloned actor
 BC_EPOCHS = _env_int("KILOBOT_BC_EPOCHS", 4)
 # saves to BC_OUT every N iterations during the run, not just once at the
@@ -163,16 +194,245 @@ def preprocess(path):
     return tensor.unsqueeze(0)
 
 
+def warm_start_load(policy, path, device):
+    """KILOBOT_INIT_ACTOR load, tolerant of exactly two architecture changes.
+
+    With cfg.msg_head_prop_input the actor's head_msg input is wider than a
+    pre-flag checkpoint's (cat([g, prop]) vs g). head_msg is the ONE module
+    where that is safe to skip: it is never trained by BC and is re-initialized
+    at warm start (the beacon readout), so the checkpoint's head_msg weights
+    are noise by construction. Every other module must still load exactly --
+    a silently skipped up1 or GRU would be a different function, which is the
+    exact failure architecture_meta exists to prevent. load_state_dict raises
+    on size mismatches even with strict=False, so the head_msg keys are
+    filtered out of the state dict BEFORE the load rather than skipped by it.
+
+    The second change is T2's homing_proprio (config.py:426-429, phase 171's
+    "loader tolerance TODO"): up1's input gains HOMING_PROP_SIZE columns. That
+    one is handled by EXTENDING the checkpoint's weights with zero rows --
+    behavior-identical at the warm start, not merely tolerated, because the
+    +3 inputs are identically zero until a referral is ever fitted
+    (observation.py:692-703), and 0 * w = 0 for whatever the appended rows
+    hold. The CRITIC-repeat of the rule: only a delta of exactly
+    HOMING_PROP_SIZE on up1's input width is extendable; any other width
+    mismatch between checkpoint and actor is still a hard refusal, as is a
+    checkpoint WIDER than the actor (an eval built without
+    KILOBOT_HOMING_PROPRIO loading a T2 checkpoint must fail, not silently
+    truncate). The appended rows are logged once so the run's own log shows
+    how much of the input layer is untrained-from-zero.
+    """
+    blob = torch.load(path, map_location=device, weights_only=False)
+    if "policy" in blob:
+        policy.load_state_dict(blob["policy"])
+        return int(blob.get("iteration", 0))
+    state = dict(blob["actor"])
+    state.pop("head_msg.weight", None)
+    state.pop("head_msg.bias", None)
+    actor = policy.actor
+    if "up1.weight" in state:
+        ckpt_in = int(state["up1.weight"].shape[1])
+        ckpt_out = int(state["up1.weight"].shape[0])
+        expected_in = int(actor.up1.in_features)
+        expected_out = int(actor.up1.out_features)
+        d_in, d_out = expected_in - ckpt_in, expected_out - ckpt_out
+        if d_in == HOMING_PROP_SIZE and d_out == 0:
+            w = state["up1.weight"]
+            extended = torch.zeros(ckpt_out, expected_in, device = device,
+                                   dtype = w.dtype)
+            extended[:, :ckpt_in] = w.to(device)
+            state["up1.weight"] = extended
+            print("warm start: up1 extended %d -> %d inputs with %d zero rows "
+                  "(homing_proprio columns; behavior-identical at load, RL "
+                  "activates them)" % (ckpt_in, expected_in, d_in))
+        elif d_in == -HOMING_PROP_SIZE and d_out == 0:
+            raise RuntimeError(
+                "warm start %s: checkpoint up1 is WIDER than the actor's "
+                "(checkpoint %d cols vs actor %d cols) -- build the eval/"
+                "trainer actor with KILOBOT_HOMING_PROPRIO to match the T2 "
+                "checkpoint, or accept a truncated first layer's function"
+                % (path, ckpt_in, expected_in))
+        elif d_in != 0 or d_out != 0:
+            raise RuntimeError(
+                "warm start %s: up1 width mismatch beyond the homing columns "
+                "(checkpoint (%d,%d) vs actor (%d,%d)) -- this loader only "
+                "zero-extends HOMING_PROP_SIZE extra input rows, everything "
+                "else is a refusal" % (path, ckpt_in, ckpt_out,
+                                       expected_in, expected_out))
+    info = actor.load_state_dict(state, strict=False)
+    missing = set(info.missing_keys)
+    if missing - {"head_msg.weight", "head_msg.bias"} or info.unexpected_keys:
+        raise RuntimeError("warm start %s is not loadable into this actor beyond "
+                           "head_msg and the homing zero-extension: missing %s, "
+                           "unexpected %s -- refusing"
+                           % (path, sorted(missing), sorted(info.unexpected_keys)))
+    if "log_std" in blob:
+        with torch.no_grad():
+            policy.log_std.copy_(blob["log_std"].to(policy.log_std.device))
+    return int(blob.get("iteration", 0))
+
+
+def apply_warm_start_message_policy(policy, cfg):
+    """Quiet message start, after KILOBOT_INIT_ACTOR loads (both RL paths).
+
+    The message head is never supervised by BC, so a warm-started head_msg is
+    random noise -- and receivers were trained (on the tapes) with neighbor
+    messages that were almost all zeros. Left alone, iteration 0 broadcasts
+    noise on all nine message floats, shifting the clone's own input
+    distribution and corrupting the navigation we are trying to fine-tune.
+    Zeroing the head (and optionally clamping the message log-std) starts
+    broadcasts at exactly the distribution the clone was trained under; the
+    entropy bonus then grows message exploration over the run.
+
+    motor_log_std is the same fix for the MOTOR dimensions, and it is the one
+    that decides whether the warm start survives at all: a bc_offline
+    checkpoint's saved log_std is an untrained placeholder (std 0.61), BC
+    only ever fit the mean, and the eval harness runs deterministic actions
+    (squash of the mean) so it never sees the placeholder either. The first
+    stochastic rollout would execute 0.5*(tanh(N(mean, 0.61))+1) per wheel --
+    random wheel speeds -- collapsing the warm start before any PPO update
+    runs (measured: settled 0.002 from iteration 0 with std_m/i 0.05/0.61 in
+    results/rl_v1_console.log; the deterministic eval of the same weights
+    scores settled<5u 0.63). Setting it (e.g. -2.5 -> std 0.082) keeps
+    executed motors within the clone's command precision.
+    """
+    if cfg.actor_type != "gru_split_observation":
+        return
+    with torch.no_grad():
+        if getattr(cfg, "quiet_msg_head", False):
+            policy.actor.head_msg.weight.zero_()
+            policy.actor.head_msg.bias.zero_()
+            if getattr(policy.actor, "msg_head_prop_input", False):
+                # The beacon readout: the honest protocol as the head's
+                # INITIALIZATION, not as a runtime override. slots 0-2 echo the
+                # robot's own belief mean position (prop[8], prop[9]) and
+                # position confidence (prop[12]; the heading concentration in
+                # prop[13] is identically 1.0 under the zero heading-noise
+                # filter, so the honest conf IS prop[12]). The tanh slopes are
+                # least-squares inits, not exact inverses (1.3 minimizes
+                # max|tanh(w x) - x| over x in [0, 0.9] at 0.078) --
+                # msg_supervision refines them, and the conf slope 2.0 puts
+                # the effective receiver-side activation gate
+                # (tanh(2c) > PEER_CONF_MIN) at c ~ 0.87, matching
+                # belief.py's own 0.85. Slots 3-8 stay zero: claims off.
+                H = policy.actor.head1.out_features
+                policy.actor.head_msg.weight[0, H + 8] = 1.3
+                policy.actor.head_msg.weight[1, H + 9] = 1.3
+                policy.actor.head_msg.weight[2, H + 12] = 2.0
+                print("beacon readout init: slots 0-2 echo own belief position/conf "
+                      "(broadcasts start as the honest protocol; slots 3-8 zero)")
+            if getattr(cfg, "recv_gate", False):
+                # The learned receiver's gate starts at the status-quo
+                # receiver: pre-tanh +2.0 -> post-squash 0.964 -> g = 0.982,
+                # sigma x1.018 -- within a rounding error of today's
+                # ungated fusion. PPO learns from there whether to close
+                # the gate (or, in principle, open it past 1).
+                policy.actor.head_msg.bias[3] = 2.0
+                print("receiver gate init: message slot 3 bias +2.0 (g ~ 0.98 "
+                      "= the ungated receiver; PPO learns from there)")
+            if getattr(cfg, "learned_veto", False):
+                # The learned broadcast veto (config.learned_veto, T2): the
+                # zeroed head + the checkpoint's msg log_std (-0.5 -> std
+                # 0.6) would sample slot 6 ~ N(0, 0.6^2) at iteration 0 --
+                # silencing ~half of all rows at random, which is the one
+                # start the veto must NOT have (it mutates the T1 writer
+                # into a coin-flip mute before any gradient has moved).
+                # Bias the pre-squash mean to +2.0: P(sample < 0) =
+                # Phi(-2.0/0.6) ~ 4e-4, so the veto starts at "never
+                # speak" (i.e. always TRANSMIT = the T1 writer, the exact
+                # baseline RL is supposed to improve on) and the entropy
+                # bonus explores silencing from there, direction confirmed
+                # by the ladder: the channel's marginal value is positive
+                # at every density, so the learned callee should have to
+                # EARN silence, not be given it.
+                veto_init = float(getattr(cfg, "veto_init", 2.0))
+                policy.actor.head_msg.bias[6] = veto_init
+                std = math.exp(float(policy.log_std[6]))
+                p_veto = 0.5 * (1.0 + math.erf(-veto_init / std))
+                print("veto init: message slot 6 bias %+.2f (transmits with "
+                      "P(veto) ~ %.1e at iteration 0; the T1 writer's bias is "
+                      "+2.0)" % (veto_init, p_veto))
+            print("quiet message head: head_msg zeroed (broadcasts start at zero)")
+        msg_log_std = float(getattr(cfg, "msg_log_std", 0.0))
+        if msg_log_std != 0.0:
+            import policy as policy_mod
+            policy.log_std[:MESSAGE_SIZE] = msg_log_std
+            print("message log_std set to %.3f (motor dims keep the checkpoint's; "
+                  "effective clamp floor is %.3f, so raise KILOBOT_LOG_STD_MIN if "
+                  "the message std is being clamped)" % (msg_log_std, policy_mod.LOG_STD_MIN))
+        motor_log_std = float(getattr(cfg, "motor_log_std", 0.0))
+        if motor_log_std != 0.0:
+            import policy as policy_mod
+            policy.log_std[MESSAGE_SIZE:] = motor_log_std
+            print("motor log_std set to %.3f (std %.3f -- the BC checkpoint's saved "
+                  "log_std is an untrained placeholder of std %.3f that deterministic "
+                  "eval never executes; see config.motor_log_std)"
+                  % (motor_log_std, math.exp(motor_log_std),
+                     math.exp(float(Config().log_std_init))))
+
+
+def make_actor_opt(policy, cfg):
+    """The actor optimizer, optionally with a separate learning rate for the
+    message head.
+
+    Rationale (first real run, docs/tuning.md phase 167): Adam's updates are
+    scale-free -- with a consistent +/- gradient an untrained head's weights
+    random-walk to O(lr * sqrt(steps)) within one iteration regardless of
+    gradient magnitude. The quiet message start (head_msg zeroed) therefore
+    un-quiets itself in a single iteration: the message mean drifts to ~0.1
+    while the stored samples sit within the message std, and the low message
+    std amplifies log-prob sensitivity by 1/std^2 -- iter-0 approx_kl
+    measured 25.4. A separate, much lower lr for head_msg slows the walk and
+    the learning together, which is the right shape for a head whose value
+    signal arrives diluted ~1/m and delayed: it should learn over tens of
+    iterations, not one. None (the default) = one group at cfg.actor_lr,
+    unchanged.
+    """
+    msg_lr = _env_float("KILOBOT_MSG_LR", 0.0)
+    freeze_rest = _env_bool("KILOBOT_FREEZE_REST", False)
+    msg_params = [p for n, p in policy.named_parameters() if "head_msg" in n]
+    if freeze_rest:
+        # T2-iteration-2's curation scope (owner-approved fork (a)): freeze
+        # everything but the message head. The first T2 run's failure is the
+        # measured case for this: with the whole actor trainable at 600, the
+        # reward's 256-tick windows never see a settled outcome and PPO
+        # drifts the motor/arrival surface (T2-final settled 0.06 vs T1-fixed
+        # 0.42, stopped 0.56 vs 0.97 -- docs/tuning.md phase 173 fs1
+        # addendum's aftermath). A frozen navigation surface turns the
+        # environment's response to any transmission policy into a fixed
+        # function, which is the well-posed case for learning an allocation.
+        # The message head's own gradient path is unaffected: PPO's loss
+        # still touches it; Adam simply never updates the rest. The frozen
+        # parameters STAY in the graph (forward runs as before); excluding
+        # them from the optimizer (rather than zeroing grads) keeps
+        # param_groups' bookkeeping honest and the checkpoint layouts
+        # identical, so a T2a checkpoint loads anywhere a T2 one does.
+        frozen = [p for n, p in policy.named_parameters()
+                  if "head_msg" not in n and p.requires_grad]
+        for p in frozen:
+            p.requires_grad_(False)
+        if msg_params:
+            for p in msg_params:
+                p.requires_grad_(True)
+        return torch.optim.Adam(msg_params, lr = msg_lr or cfg.actor_lr)
+    if msg_lr > 0.0 and msg_params:
+        other = [p for n, p in policy.named_parameters() if "head_msg" not in n]
+        return torch.optim.Adam([
+            {"params": other, "lr": cfg.actor_lr},
+            {"params": msg_params, "lr": msg_lr},
+        ])
+    return torch.optim.Adam(policy.parameters(), lr=cfg.actor_lr)
+
+
 def resolve_behavior(env):
-    if BEHAVIOR_NAME is not None:
-        return BEHAVIOR_NAME
-    for name in env.behavior_specs:
-        spec = env.behavior_specs[name]
-        if spec.action_spec.continuous_size == ACTION_SIZE:
-            return name
-    raise RuntimeError(
-        "No behavior with %d continuous actions was found. Set BEHAVIOR_NAME explicitly." % ACTION_SIZE
-    )
+    # Delegates to unity_env.resolve_behavior, the version that steps the
+    # environment (bounded) until the Kilobot behavior registers. launch.py
+    # carried its own non-stepping copy of the same concept: ml-agents only
+    # registers a behavior once one of its agents has requested a decision,
+    # so with a small swarm where nobody has an event on tick 0 -- 2 arenas,
+    # a dozen robots -- the immediate check raised instead of stepping until
+    # the heartbeat brought a behavior in. One definition, not two; the
+    # explicit KILOBOT_BEHAVIOR override still wins.
+    return unity_env.resolve_behavior(env, behavior_name=BEHAVIOR_NAME)
 
 
 def check_latent_dim(encoder, pool, device):
@@ -196,6 +456,21 @@ def dump_behaviors(env):
 
 
 def make_env(worker_id):
+    if MIN_BOTS is not None or MAX_BOTS is not None:
+        if MIN_BOTS is None or MAX_BOTS is None:
+            raise SystemExit("KILOBOT_MIN_BOTS and KILOBOT_MAX_BOTS must be set "
+                             "together: a player whose swarm shrinks or grows between "
+                             "episodes invalidates the trainer's per-trajectory robot "
+                             "tips")
+        os.environ["KILOBOT_MIN_BOTS"] = str(MIN_BOTS)
+        os.environ["KILOBOT_MAX_BOTS"] = str(MAX_BOTS)
+        if worker_id == 0:
+            print("player swarm size pinned: min=max=%d (KILOBOT_MIN_BOTS/KILOBOT_MAX_BOTS)"
+                  % MIN_BOTS)
+    else:
+        if worker_id == 0:
+            print("KILOBOT_MIN_BOTS unset: the player trains at its own build "
+                  "default swarm size (SwarmManager's Inspector values)")
     if SWARM_RNG is not None:
         # Offset per worker, and set immediately before this player launches:
         # SwarmManager reads KILOBOT_SWARM_RNG once, in Awake, from the
@@ -215,6 +490,11 @@ def make_env(worker_id):
     # Set it here, before the player inherits the environment at startup.
     if FORMATIONS_DIR:
         os.environ["KILOBOT_FORMATIONS"] = os.path.abspath(FORMATIONS_DIR)
+    # See BAKE_ROTATION_STEPS above: the player defaults to 1, which rotates
+    # the baked distance field 90 degrees from the geometry the oracle, the
+    # formation pool, and the settle metric all use. This must be set before
+    # the player inherits the environment at startup.
+    os.environ["KILOBOT_BAKE_ROTATION_STEPS"] = str(BAKE_ROTATION_STEPS)
     critic_channel = CriticChannel()
     params_channel = EnvironmentParametersChannel()
     engine_channel = EngineConfigurationChannel()
@@ -437,6 +717,26 @@ def main():
     cfg.tau_v = _env_float("KILOBOT_TAU_V", cfg.tau_v)
     cfg.l_scale = _env_float("KILOBOT_L_SCALE", cfg.l_scale)
     cfg.reward_shaping = _env_float("KILOBOT_REWARD_SHAPING", cfg.reward_shaping)
+    cfg.target_shaping = _env_float("KILOBOT_TARGET_SHAPING", cfg.target_shaping)
+    cfg.stop_bonus = _env_float("KILOBOT_STOP_BONUS", cfg.stop_bonus)
+    cfg.stop_radius = _env_float("KILOBOT_STOP_RADIUS", cfg.stop_radius)
+    cfg.global_shaping = _env_float("KILOBOT_GLOBAL_SHAPING", cfg.global_shaping)
+    cfg.quiet_msg_head = _env_bool("KILOBOT_QUIET_MSG_HEAD", cfg.quiet_msg_head)
+    cfg.msg_log_std = _env_float("KILOBOT_MSG_LOG_STD", cfg.msg_log_std)
+    # config.motor_log_std's own comment is the full rationale. The short
+    # version: the warm start is executed stochastically in RL but was
+    # evaluated deterministically, and the checkpoint's saved motor log_std
+    # is an untrained placeholder (std 0.61) -- without this override the
+    # first stochastic rollout drives the swarm on random wheel speeds and
+    # the warm start is dead before PPO's first update.
+    cfg.motor_log_std = _env_float("KILOBOT_MOTOR_LOG_STD", getattr(cfg, "motor_log_std", 0.0))
+    cfg.msg_supervision = _env_float("KILOBOT_MSG_SUPERVISION", getattr(cfg, "msg_supervision", 0.0))
+    # kilobot_gnn's SplitObservationActor comment has the full rationale. The
+    # beacon is a readout of the robot's own filter state instead of a
+    # function the trunk has to learn -- the design that keeps the warm
+    # start intact.
+    cfg.msg_head_prop_input = _env_bool("KILOBOT_MSG_HEAD_PROP_INPUT",
+                                        getattr(cfg, "msg_head_prop_input", False))
     cfg.success_threshold = _env_float("KILOBOT_SUCCESS_THRESHOLD", cfg.success_threshold)
     cfg.actor_type = _env("KILOBOT_ACTOR", cfg.actor_type)
     cfg.gru_hidden = _env_int("KILOBOT_GRU_HIDDEN", cfg.gru_hidden)
@@ -493,6 +793,17 @@ def main():
     cfg.bc_actor_eval_interval = _env_int("KILOBOT_BC_ACTOR_EVAL_INTERVAL", getattr(cfg, "bc_actor_eval_interval", 1))
     cfg.arrived_confidence_threshold = _env_float("KILOBOT_ARRIVED_CONFIDENCE_THRESHOLD", cfg.arrived_confidence_threshold)
     cfg.arrived_release_threshold = _env_float("KILOBOT_ARRIVED_RELEASE_THRESHOLD", getattr(cfg, "arrived_release_threshold", 0.0))
+    # config.py's own arrived_freeze_hidden has the full rationale. Wired now
+    # because every eval harness ran this OFF (the offline pipeline's tools
+    # default it off: "a frozen recurrence at deployment is one the training
+    # never saw") while launch.py's default silently kept Config's True -- so
+    # a launch.py-launched run with arrived_release_threshold > 0 latches
+    # robots whose GRU can then never evolve on unchanging observations, the
+    # head logit can never drop back below the release bar, and every wrong
+    # latch becomes a permanent strand. The eval numbers were measured with
+    # this off; RL fine-tuning must match them or the release hysteresis is
+    # dead on arrival.
+    cfg.arrived_freeze_hidden = _env_bool("KILOBOT_ARRIVED_FREEZE_HIDDEN", cfg.arrived_freeze_hidden)
     cfg.turn_anchor_latch = _env_bool("KILOBOT_TURN_ANCHOR_LATCH", getattr(cfg, "turn_anchor_latch", True))
     # The arrival gate, deployed: swap (or OR) the learned arrived head for the
     # oracle's own closed-form rule (config.py's use_closed_form_arrived /
@@ -510,6 +821,12 @@ def main():
                                        getattr(cfg, "closed_form_hybrid", False))
     cfg.closed_form_and_gate = _env_bool("KILOBOT_CLOSED_FORM_AND",
                                          getattr(cfg, "closed_form_and_gate", False))
+    cfg.closed_form_release = _env_bool("KILOBOT_CLOSED_FORM_RELEASE",
+                                        getattr(cfg, "closed_form_release", False))
+    cfg.release_repudiate_conf = _env_float("KILOBOT_RELEASE_REPUDIATE_CONF",
+                                            getattr(cfg, "release_repudiate_conf", 0.15))
+    cfg.release_repudiate_dist = _env_float("KILOBOT_RELEASE_REPUDIATE_DIST",
+                                            getattr(cfg, "release_repudiate_dist", 0.12))
     # The three auxiliary heads (arrived, state, wall) plus the oracle head and
     # steer feature. Same direct bug the two flags above fixed: build_actor(cfg)
     # here has no access to what a checkpoint was trained with, and load_for_eval
@@ -534,10 +851,125 @@ def main():
     cfg.prop_time_scale = _env_float("KILOBOT_PROP_TIME_SCALE", cfg.prop_time_scale)
     cfg.prop_cum_scale = _env_float("KILOBOT_PROP_CUM_SCALE", cfg.prop_cum_scale)
     cfg.reward_mode = _env("KILOBOT_REWARD_MODE", cfg.reward_mode)
+    cfg.target_acc_weight = _env_float("KILOBOT_TARGET_ACC_WEIGHT", cfg.target_acc_weight)
+    cfg.target_acc_sigma = _env_float("KILOBOT_TARGET_ACC_SIGMA", cfg.target_acc_sigma)
+    cfg.target_time_cost = _env_float("KILOBOT_TARGET_TIME_COST", cfg.target_time_cost)
+    cfg.success_metric = _env("KILOBOT_SUCCESS_METRIC", cfg.success_metric)
+    cfg.global_potential_sigma = _env_float("KILOBOT_GLOBAL_POTENTIAL_SIGMA", cfg.global_potential_sigma)
+    # The belief-error reward terms (docs/tuning.md, the transmission phase):
+    # per-robot PBRS on own belief error, plus the belief band of the shared
+    # arena potential -- the band that moves during localization, where a
+    # helpful broadcast does its work and where the settled kernel alone is
+    # structurally flat.
+    cfg.belief_shaping = _env_float("KILOBOT_BELIEF_SHAPING", getattr(cfg, "belief_shaping", 0.0))
+    cfg.belief_potential_sigma = _env_float("KILOBOT_BELIEF_POTENTIAL_SIGMA",
+                                            getattr(cfg, "belief_potential_sigma", 0.20))
+    cfg.belief_potential_weight = _env_float("KILOBOT_BELIEF_POTENTIAL_WEIGHT",
+                                             getattr(cfg, "belief_potential_weight", 1.0))
+    cfg.beacon_honesty = _env_float("KILOBOT_BEACON_HONESTY", getattr(cfg, "beacon_honesty", 0.0))
     cfg.speed_weight = _env_float("KILOBOT_SPEED_WEIGHT", cfg.speed_weight)
     cfg.steer_weight = _env_float("KILOBOT_STEER_WEIGHT", cfg.steer_weight)
     cfg.seed_layout = _env("KILOBOT_SEED_LAYOUT", cfg.seed_layout)
     cfg.belief_comms = _env_bool("KILOBOT_BELIEF_COMMS", cfg.belief_comms)
+    # config.belief_comms_learned: with belief_comms on, let the POLICY's
+    # message head supply the beacon content instead of the honest-position
+    # override. Same default-preserving pattern as every flag above.
+    cfg.belief_comms_learned = _env_bool("KILOBOT_BELIEF_COMMS_LEARNED",
+                                         getattr(cfg, "belief_comms_learned", False))
+    # Phase-169 protocol knobs (docs/tuning.md): the receiver-side fusion and
+    # arrival-gate protection the stage-A diagnostics run behind. Same
+    # default-preserving pattern as every flag above.
+    cfg.tc_peer_zero = _env_bool("KILOBOT_TC_PEER_ZERO", getattr(cfg, "tc_peer_zero", False))
+    cfg.beacon_arrived_only = _env_bool("KILOBOT_BEACON_ARRIVED_ONLY",
+                                        getattr(cfg, "beacon_arrived_only", False))
+    cfg.peer_innovation_min = _env_float("KILOBOT_PEER_INNOVATION_MIN",
+                                         getattr(cfg, "peer_innovation_min", 0.0))
+    cfg.peer_conf_min = _env_float("KILOBOT_PEER_CONF_MIN",
+                                   getattr(cfg, "peer_conf_min", 0.85))
+    cfg.beacon_anchored_min_conf = _env_float("KILOBOT_BEACON_ANCHORED_MIN_CONF",
+                                              getattr(cfg, "beacon_anchored_min_conf", 0.0))
+    cfg.hop_comms = _env_bool("KILOBOT_HOP_COMMS",
+                              getattr(cfg, "hop_comms", False))
+    cfg.recv_gate = _env_bool("KILOBOT_RECV_GATE",
+                              getattr(cfg, "recv_gate", False))
+    cfg.arrival_min_anchored = _env_bool("KILOBOT_ARRIVAL_MIN_ANCHORED",
+                                         getattr(cfg, "arrival_min_anchored", False))
+    cfg.arrival_persist = _env_int("KILOBOT_ARRIVAL_PERSIST", getattr(cfg, "arrival_persist", 1))
+    # Phase-170 peer-fix knobs (config.py has the full rationale): the
+    # multi-beacon position fix that replaces single-ring peer fusion.
+    cfg.peer_fix = _env_bool("KILOBOT_PEER_FIX", getattr(cfg, "peer_fix", False))
+    cfg.peer_fix_topk = _env_int("KILOBOT_PEER_FIX_TOPK", getattr(cfg, "peer_fix_topk", 6))
+    cfg.peer_fix_resid_max = _env_float("KILOBOT_PEER_FIX_RESID_MAX",
+                                        getattr(cfg, "peer_fix_resid_max", 1.5))
+    cfg.peer_inject_min_spread = _env_float("KILOBOT_PEER_INJECT_MIN_SPREAD",
+                                            getattr(cfg, "peer_inject_min_spread", 0.2))
+    cfg.peer_inject_cooldown_ticks = _env_int("KILOBOT_PEER_INJECT_COOLDOWN_TICKS",
+                                              getattr(cfg, "peer_inject_cooldown_ticks", 400))
+    # Phase-171/172 evidence channel + the T2 learning surface (config.py has
+    # the full rationale for each knob; evidence.py documents the wire
+    # format). Same default-preserving pattern as every flag above -- until
+    # this block the ONLY path that could enable the channel was
+    # tools/eval_closed_loop.py's args, so the RL fine-tune could never train
+    # the thing the density ladder measured. Ports the eval tool's guards so
+    # invalid combinations fail loudly here too instead of silently
+    # interacting through trainer's writer path.
+    cfg.evidence_comms = _env_bool("KILOBOT_EVIDENCE_COMMS", getattr(cfg, "evidence_comms", False))
+    cfg.evidence_beacon_conf = _env_float("KILOBOT_EVIDENCE_BEACON_CONF",
+                                          getattr(cfg, "evidence_beacon_conf", 0.7))
+    cfg.disclosure_recency_ticks = _env_int("KILOBOT_DISCLOSURE_RECENCY_TICKS",
+                                            getattr(cfg, "disclosure_recency_ticks", 2000))
+    cfg.claim_store_capacity = _env_int("KILOBOT_CLAIM_STORE_CAPACITY",
+                                        getattr(cfg, "claim_store_capacity", 8))
+    cfg.claim_odo_var_rate = _env_float("KILOBOT_CLAIM_ODO_VAR_RATE",
+                                        getattr(cfg, "claim_odo_var_rate", 0.004))
+    cfg.consensus_agreement_min = _env_float("KILOBOT_CONSENSUS_AGREEMENT_MIN",
+                                             getattr(cfg, "consensus_agreement_min", 0.10))
+    cfg.referral_homing = _env_bool("KILOBOT_REFERRAL_HOMING",
+                                    getattr(cfg, "referral_homing", False))
+    cfg.homing_grace_ticks = _env_int("KILOBOT_HOMING_GRACE_TICKS",
+                                      getattr(cfg, "homing_grace_ticks", 120))
+    cfg.homing_budget_ticks = _env_int("KILOBOT_HOMING_BUDGET_TICKS",
+                                       getattr(cfg, "homing_budget_ticks", 400))
+    cfg.homing_proprio = _env_bool("KILOBOT_HOMING_PROPRIO",
+                                   getattr(cfg, "homing_proprio", False))
+    cfg.learned_veto = _env_bool("KILOBOT_LEARNED_VETO",
+                                 getattr(cfg, "learned_veto", False))
+    cfg.learned_self_trust = _env_bool("KILOBOT_LEARNED_SELF_TRUST",
+                                       getattr(cfg, "learned_self_trust", False))
+    # The veto's initial pre-squash bias (apply_warm_start_message_policy).
+    # Default +2.0 = the T1 writer (P(veto) ~ 4e-4 at std 0.6); the
+    # exploration variant sets ~0.5 (P(veto) ~ 20% at iteration 0) to test
+    # whether the veto CAN learn when silence is reachable from the start.
+    # Applies on RESUME too: load_checkpoint restores the checkpoint's own
+    # bias, so the re-application below is what makes an exploration run of
+    # an already-trained veto possible.
+    cfg.veto_init = _env_float("KILOBOT_VETO_INIT",
+                               getattr(cfg, "veto_init", 2.0))
+    if cfg.evidence_comms and (cfg.hop_comms or cfg.recv_gate):
+        raise SystemExit("KILOBOT_EVIDENCE_COMMS is incompatible with KILOBOT_HOP_COMMS/"
+                         "KILOBOT_RECV_GATE: retired slot usage collides (eval_closed_loop "
+                         "raises on the same combination -- tools/eval_closed_loop.py:388)")
+    if cfg.referral_homing and not cfg.evidence_comms:
+        raise SystemExit("KILOBOT_REFERRAL_HOMING requires KILOBOT_EVIDENCE_COMMS: the "
+                         "referral store's senders are the evidence channel's disclosure "
+                         "writers (eval_closed_loop applies the same AND)")
+    if cfg.learned_veto and not cfg.evidence_comms:
+        raise SystemExit("KILOBOT_LEARNED_VETO requires KILOBOT_EVIDENCE_COMMS: slot 6 "
+                         "is a veto only under the disclosure wire format (eval_closed_loop "
+                         "applies the same AND)")
+    if cfg.learned_self_trust and not cfg.evidence_comms:
+        raise SystemExit("KILOBOT_LEARNED_SELF_TRUST requires KILOBOT_EVIDENCE_COMMS: "
+                         "slot 7 is a self-trust annotation only under the disclosure "
+                         "wire format (docs/t2b_design.md)")
+    # Append each robot's 11 belief_read values to the CRITIC's node inputs so
+    # the value baseline can represent localization state -- REQUIRED for PPO
+    # to baseline the belief-error reward terms properly, and missing here
+    # until now: tools/launch_rl_o3.sh has set KILOBOT_CRITIC_BELIEF_FEATURES
+    # since that script was written, but launch.py never read it, so every
+    # launch.py-run run silently ignored it (the same env-wiring-divergence
+    # class as phase 167's KILOBOT_ARRIVED_FREEZE_HIDDEN).
+    cfg.critic_belief_features = _env_bool("KILOBOT_CRITIC_BELIEF_FEATURES",
+                                           getattr(cfg, "critic_belief_features", False))
     cfg.belief_conf_bonus = _env_float("KILOBOT_BELIEF_CONF_BONUS", cfg.belief_conf_bonus)
     cfg.belief_conf_bonus_iters = _env_int("KILOBOT_BELIEF_CONF_BONUS_ITERS", cfg.belief_conf_bonus_iters)
     cfg.seed_find_bonus = _env_float("KILOBOT_SEED_FIND_BONUS", cfg.seed_find_bonus)
@@ -628,12 +1060,12 @@ def main():
         from parallel import ParallelTrainer
         actor = build_actor(cfg).to(cfg.device)
         policy = GaussianPolicy(actor, cfg.log_std_init).to(cfg.device)
-        critic = Critic().to(cfg.device)
-        actor_opt = torch.optim.Adam(policy.parameters(), lr=cfg.actor_lr)
+        critic = make_critic(cfg).to(cfg.device)
+        actor_opt = make_actor_opt(policy, cfg)
         critic_opt = torch.optim.Adam(critic.parameters(), lr=cfg.critic_lr)
         if INIT_ACTOR is not None:
-            from checkpoint import load_for_eval
-            load_for_eval(INIT_ACTOR, policy, cfg.device)
+            warm_start_load(policy, INIT_ACTOR, cfg.device)
+            apply_warm_start_message_policy(policy, cfg)
             print("warm-started actor from %s" % INIT_ACTOR)
         # The split-observation actor needs cfg._oracle_formation_pool for the
         # workers' target assignment (observation.py's KNOWN GAP). Built here,
@@ -654,6 +1086,16 @@ def main():
             from checkpoint import load_checkpoint
             start_iter = load_checkpoint(RESUME, policy, critic, actor_opt, critic_opt, cfg.device)
             print("resumed from %s at iteration %d" % (RESUME, start_iter))
+            if getattr(cfg, "learned_veto", False):
+                # Re-apply the veto init after the resume (parallel path; the
+                # sequential path mirrors this): the checkpoint's saved bias
+                # is whatever its own run trained, and an exploration run
+                # exists to change that starting point -- cfg.veto_init wins,
+                # loudly.
+                vi = float(getattr(cfg, "veto_init", 2.0))
+                with torch.no_grad():
+                    policy.actor.head_msg.bias[6] = vi
+                print("veto init re-applied on resume: bias[6] = %+.2f" % vi)
         ckpt_path = os.path.join(run_dir, "ckpt.pt")
         trainer = ParallelTrainer(cfg, NUM_WORKERS)
         trainer.run(policy, critic, actor_opt, critic_opt, iterations, logger=logger,
@@ -720,8 +1162,8 @@ def main():
 
         actor = build_actor(cfg).to(cfg.device)
         policy = GaussianPolicy(actor, cfg.log_std_init).to(cfg.device)
-        critic = Critic().to(cfg.device)
-        actor_opt = torch.optim.Adam(policy.parameters(), lr=cfg.actor_lr)
+        critic = make_critic(cfg).to(cfg.device)
+        actor_opt = make_actor_opt(policy, cfg)
         critic_opt = torch.optim.Adam(critic.parameters(), lr=cfg.critic_lr)
 
         if NUM_ENVS == 1:
@@ -740,8 +1182,8 @@ def main():
         print("to view metrics: tensorboard --logdir", LOGDIR)
 
         if INIT_ACTOR is not None:
-            from checkpoint import load_for_eval
-            load_for_eval(INIT_ACTOR, policy, cfg.device)
+            warm_start_load(policy, INIT_ACTOR, cfg.device)
+            apply_warm_start_message_policy(policy, cfg)
             print("warm-started actor from %s" % INIT_ACTOR)
 
         if MODE == "bc":
@@ -778,6 +1220,11 @@ def main():
             from checkpoint import load_checkpoint
             start_iter = load_checkpoint(RESUME, policy, critic, actor_opt, critic_opt, cfg.device)
             print("resumed from %s at iteration %d" % (RESUME, start_iter))
+            if getattr(cfg, "learned_veto", False):
+                vi = float(getattr(cfg, "veto_init", 2.0))
+                with torch.no_grad():
+                    policy.actor.head_msg.bias[6] = vi
+                print("veto init re-applied on resume: bias[6] = %+.2f" % vi)
         ckpt_path = os.path.join(run_dir, "ckpt.pt")
         trainer.run(policy, critic, actor_opt, critic_opt, iterations, logger=logger,
                     ckpt_path=ckpt_path, ckpt_every=CKPT_EVERY, start_iter=start_iter,

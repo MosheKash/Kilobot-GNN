@@ -20,7 +20,7 @@ from ppo import ppo_update
 from metrics import Logger
 from trainer import check_startup_coverage, conf_bonus_schedule
 from trainer import shaping_schedule
-from metrics import rollout_stats, aggregate_payloads
+from metrics import rollout_stats, aggregate_payloads, tb_view
 from checkpoint import save_checkpoint, export_actor
 from kilobot_gnn import DB_ROW_SIZE
 
@@ -156,6 +156,8 @@ def build_stats(ppo_logs, payloads, timings, dt, t_collect, t_ppo, total_steps):
              "ppo/critic_grad_norm": ppo_logs["critic_grad_norm"],
              "policy/log_std_mean": ppo_logs["log_std_mean"],
              "policy/std_mean": ppo_logs["std_mean"],
+             "policy/std_msg": ppo_logs.get("std_msg", 0.0),
+             "policy/std_motor": ppo_logs.get("std_motor_eff", 0.0),
              "time/iter_seconds": dt,
              "time/steps_per_sec": total_steps / dt if dt > 0 else 0.0,
              "time/collect_sec": t_collect,
@@ -314,7 +316,7 @@ class ParallelTrainer:
                 step = step + total_steps
 
                 stats = build_stats(ppo_logs, payloads, timings, dt, t_collect, t_ppo, total_steps)
-                logger.log_scalars(stats, step)
+                logger.log_scalars(tb_view(stats, self.cfg), step)
                 logger.console(it, step, stats)
                 if summary is not None:
                     summary.update(it, stats)
@@ -322,7 +324,8 @@ class ParallelTrainer:
                       % (t_collect, stats.get("time/worker_step_max", 0.0), t_ppo, self.num_workers, self.cfg.rollout_steps))
 
                 if it == start_iter:
-                    check_startup_coverage(stats, min_start_cov)
+                    check_startup_coverage(stats, min_start_cov,
+                                           getattr(self.cfg, "success_metric", "coverage"))
 
                 if ckpt_path is not None and ckpt_every > 0 and (it + 1) % ckpt_every == 0:
                     save_checkpoint(ckpt_path, it + 1, policy, critic, actor_opt, critic_opt)

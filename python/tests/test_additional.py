@@ -803,9 +803,16 @@ def test_resolve_behavior_raises_when_no_match():
     class FakeEnv:
         behavior_specs = {"Other": Spec(3)}
 
+        def step(self):
+            pass
+
     old = launch.BEHAVIOR_NAME
     launch.BEHAVIOR_NAME = None
     try:
+        # launch.resolve_behavior now delegates to unity_env.resolve_behavior,
+        # which steps (bounded) before concluding no behavior matches -- the
+        # small-swarm fix. The contract under test is unchanged: no behavior
+        # with the actor's action width still raises.
         with pytest.raises(RuntimeError):
             launch.resolve_behavior(FakeEnv())
     finally:

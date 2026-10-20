@@ -63,16 +63,39 @@ class Logger:
             self.writer.add_histogram(key, values, step)
 
     def console(self, it, step, stats):
-        reward = stats.get("episodes/mean_reward", float("nan"))
-        success = stats.get("episodes/success_rate", float("nan"))
-        cov = stats.get("rollout/mean_coverage", float("nan"))
-        pol = stats.get("losses/policy", float("nan"))
-        val = stats.get("losses/value", float("nan"))
-        ent = stats.get("losses/entropy", float("nan"))
-        kl = stats.get("ppo/approx_kl", float("nan"))
+        # The one line per iteration: objective first, then the two things
+        # that predict whether it will keep working (critic fit, policy
+        # health), then throughput. The full detail lives in TensorBoard.
+        # Under success_metric=settled the settled value IS the repurposed
+        # mean_coverage (phase 153/165 convention); labelled accordingly.
+        label = "settled" if "reward/accuracy_income_mean" in stats else "cov"
+        main = stats.get("objective/settled_fraction", stats.get("rollout/mean_coverage", float("nan")))
+        succ = stats.get("objective/success_rate", stats.get("rollout/success_rate", float("nan")))
+        stop_n = stats.get("reward/stop_bonus_count", None)
+        stop_m = stats.get("reward/stop_bonus_missed", 0.0)
+        stop = " stop %d(-%d)" % (stop_n, stop_m) if stop_n is not None else ""
+        acc = stats.get("reward/accuracy_income_mean", None)
+        accs = " acc %.4f" % acc if acc is not None else ""
+        # Mean belief error (|filter mean - truth|, normalized): the
+        # localization-health readout. Falling = the swarm is figuring out
+        # where it is; flat-high = nobody localizes; rising = the filters are
+        # being corrupted (garbage broadcasts fuse as wrong beacons).
+        berr = stats.get("belief/mean_belief_err", None)
+        berrs = " berr %.3f" % berr if berr is not None else ""
+        rs = stats.get("rollout/mean_step_reward", float("nan"))
+        pol = stats.get("optim/policy_loss", stats.get("losses/policy", float("nan")))
+        val = stats.get("optim/value_loss", stats.get("losses/value", float("nan")))
+        ent = stats.get("optim/entropy", stats.get("losses/entropy", float("nan")))
+        kl = stats.get("optim/approx_kl", stats.get("ppo/approx_kl", float("nan")))
+        ev = stats.get("optim/explained_variance", stats.get("ppo/explained_variance", float("nan")))
+        sm = stats.get("policy/std_msg", None)
+        st = stats.get("policy/std_motor", None)
+        stds = " std_m/i %.2f/%.2f" % (sm, st) if sm is not None and st is not None else ""
+        mg = stats.get("grads/message", stats.get("motor/msg_grad_norm", None))
+        mgs = " msg_g %.4g" % mg if mg is not None else ""
         sps = stats.get("time/steps_per_sec", float("nan"))
-        print("iter %d step %d | ep_rew %.3f succ %.2f cov %.3f | pol %.4f val %.4f ent %.3f kl %.4f | %.0f sps"
-              % (it, step, reward, success, cov, pol, val, ent, kl, sps))
+        print("iter %d step %d | %s %.3f succ %.2f r_step %.4f%s%s%s | pol %.4f val %.4f ent %.3f kl %.4f ev %.2f%s | %.0f sps"
+              % (it, step, label, main, succ, rs, stop, accs, berrs, pol, val, ent, kl, ev, mgs + stds, sps))
 
     def close(self):
         if self.writer is not None:
@@ -95,6 +118,32 @@ def rollout_stats(payload):
         sh = payload.get("shaping_sum", 0.0)
         if sh != 0.0:
             stats["reward/shaping_mean"] = sh / payload["reward_count"]
+        ts = payload.get("target_shaping_sum", 0.0)
+        if ts != 0.0:
+            stats["reward/target_shaping_mean"] = ts / payload["reward_count"]
+        gs = payload.get("global_shaping_sum", 0.0)
+        if gs != 0.0:
+            stats["reward/global_shaping_mean"] = gs / payload["reward_count"]
+        bs = payload.get("belief_shaping_sum", 0.0)
+        if bs != 0.0:
+            stats["reward/belief_shaping_mean"] = bs / payload["reward_count"]
+        oc = payload.get("overclaim_sum", 0.0)
+        if oc != 0.0:
+            stats["reward/beacon_overclaim_mean"] = oc / payload["reward_count"]
+        bec = payload.get("belief_err_count", 0)
+        if bec > 0:
+            stats["belief/mean_belief_err"] = payload.get("belief_err_sum", 0.0) / bec
+        sb = payload.get("stop_bonus_count", 0)
+        sm = payload.get("stop_bonus_missed", 0)
+        if sb > 0 or sm > 0:
+            stats["reward/stop_bonus_count"] = float(sb)
+            stats["reward/stop_bonus_missed"] = float(sm)
+        ai = payload.get("acc_income_sum", 0.0)
+        if ai != 0.0:
+            stats["reward/accuracy_income_mean"] = ai / payload["reward_count"]
+        tc = payload.get("time_cost_sum", 0.0)
+        if tc != 0.0:
+            stats["reward/time_cost_mean"] = tc / payload["reward_count"]
     bc = payload.get("belief_count", 0)
     if bc > 0:
         stats["belief/mean_conf_pos"] = payload["conf_pos_sum"] / bc
@@ -150,6 +199,12 @@ def aggregate_payloads(payloads):
            "disp_sum": 0.0, "disp_count": 0,
            "split_seed_events": 0, "split_total_events": 0, "split_heartbeat_events": 0,
            "seed_find_bonus_sum": 0.0, "wall_find_penalty_sum": 0.0,
+           "target_shaping_sum": 0.0, "target_shaping_count": 0,
+           "global_shaping_sum": 0.0, "global_shaping_count": 0,
+           "belief_shaping_sum": 0.0, "belief_err_sum": 0.0, "belief_err_count": 0,
+           "overclaim_sum": 0.0,
+           "stop_bonus_count": 0, "stop_bonus_missed": 0,
+           "acc_income_sum": 0.0, "time_cost_sum": 0.0,
            "belief_conf_bonus_sum": 0.0, "shaping_sum": 0.0,
            "conf_pos_sum": 0.0, "conf_x_sum": 0.0, "conf_y_sum": 0.0,
            "localized_count": 0, "belief_count": 0,
@@ -168,6 +223,18 @@ def aggregate_payloads(payloads):
         agg["split_heartbeat_events"] = agg["split_heartbeat_events"] + p.get("split_heartbeat_events", 0)
         agg["seed_find_bonus_sum"] = agg["seed_find_bonus_sum"] + p.get("seed_find_bonus_sum", 0.0)
         agg["wall_find_penalty_sum"] = agg["wall_find_penalty_sum"] + p.get("wall_find_penalty_sum", 0.0)
+        agg["target_shaping_sum"] = agg["target_shaping_sum"] + p.get("target_shaping_sum", 0.0)
+        agg["target_shaping_count"] = agg["target_shaping_count"] + p.get("target_shaping_count", 0)
+        agg["global_shaping_sum"] = agg["global_shaping_sum"] + p.get("global_shaping_sum", 0.0)
+        agg["global_shaping_count"] = agg["global_shaping_count"] + p.get("global_shaping_count", 0)
+        agg["belief_shaping_sum"] = agg["belief_shaping_sum"] + p.get("belief_shaping_sum", 0.0)
+        agg["belief_err_sum"] = agg["belief_err_sum"] + p.get("belief_err_sum", 0.0)
+        agg["belief_err_count"] = agg["belief_err_count"] + p.get("belief_err_count", 0)
+        agg["overclaim_sum"] = agg["overclaim_sum"] + p.get("overclaim_sum", 0.0)
+        agg["stop_bonus_count"] = agg["stop_bonus_count"] + p.get("stop_bonus_count", 0)
+        agg["stop_bonus_missed"] = agg["stop_bonus_missed"] + p.get("stop_bonus_missed", 0)
+        agg["acc_income_sum"] = agg["acc_income_sum"] + p.get("acc_income_sum", 0.0)
+        agg["time_cost_sum"] = agg["time_cost_sum"] + p.get("time_cost_sum", 0.0)
         agg["belief_conf_bonus_sum"] = agg["belief_conf_bonus_sum"] + p.get("belief_conf_bonus_sum", 0.0)
         agg["shaping_sum"] = agg["shaping_sum"] + p.get("shaping_sum", 0.0)
         agg["conf_pos_sum"] = agg["conf_pos_sum"] + p.get("conf_pos_sum", 0.0)
@@ -186,21 +253,92 @@ def aggregate_payloads(payloads):
 
 
 def build_histograms(ep_records, buffer, policy, message_size):
+    # Deliberately three, not seven: the action distributions (what the policy
+    # is actually sampling, motors and messages separately -- the message
+    # histogram is how you watch the quiet start open up) and the raw log-std
+    # parameter. Advantage/return/value histograms were dropped: the same
+    # information is in optim/explained_variance, and episodes/* scalars
+    # already carry the per-episode numbers.
     out = {}
-    if len(ep_records) > 0:
-        out["episodes/reward"] = torch.tensor([e["reward"] for e in ep_records])
-        out["episodes/length"] = torch.tensor([float(e["length"]) for e in ep_records])
-        out["episodes/coverage"] = torch.tensor([e["coverage"] for e in ep_records])
-    if len(buffer.advantages) > 0:
-        out["dist/advantages"] = torch.cat(buffer.advantages)
-        out["dist/returns"] = torch.cat(buffer.returns)
-        out["dist/values"] = torch.cat(buffer.values)
     if len(buffer.decisions) > 0:
         actions = torch.stack([d["action"] for d in buffer.decisions])
         out["dist/action_transmission"] = actions[:, :message_size].reshape(-1)
         out["dist/action_motors"] = actions[:, message_size:].reshape(-1)
     out["policy/log_std"] = policy.log_std.detach()
     return {key: value.detach().cpu() for key, value in out.items()}
+
+
+# ── the TensorBoard view ──────────────────────────────────────────────────────
+# merge_stats returns the FULL stats dict, which RunSummary (and therefore the
+# sweep) consumes. TensorBoard gets a curated projection of the same dict --
+# objective first, the four health charts, and only the reward terms actually
+# active in this run's mode. Investigation-era diagnostics (pre-activation
+# means, parameter drifts, per-part timings) stay in the full dict for the
+# summary but do not chart.
+
+TB_RENAME = {
+    "rollout/mean_coverage": "objective/settled_fraction",
+    "episodes/success_rate": "objective/success_rate",
+    "episodes/mean_reward": "objective/mean_episode_reward",
+    "losses/policy": "optim/policy_loss",
+    "losses/value": "optim/value_loss",
+    "losses/entropy": "optim/entropy",
+    "ppo/approx_kl": "optim/approx_kl",
+    "ppo/clip_fraction": "optim/clip_fraction",
+    "ppo/explained_variance": "optim/explained_variance",
+    "motor/grad_norm": "grads/motor",
+    "motor/msg_grad_norm": "grads/message",
+    "policy/std_msg": "policy/std_message",
+    "reward/on_fraction": "diag/on_shape_fraction_any_pixel",
+    "belief/mean_conf_pos": "diag/belief_conf_pos",
+    "belief/mean_belief_err": "diag/belief_err",
+    "belief/frac_localized": "diag/belief_frac_localized",
+    "rollout/split_seed_fraction": "diag/split_seed_fraction",
+    "rollout/decision_rate": "diag/decision_rate",
+    "rollout/mean_displacement": "diag/mean_displacement",
+}
+
+# Dropped unconditionally: investigation-era diagnostics whose questions are
+# already answered by the charts above (explained_variance covers value fit;
+# the settle numbers cover behaviour; drift/saturation/pre-activation charts
+# were the phase-6..9 debugging instruments, not run monitors).
+TB_DROP = {
+    "motor/saturation", "motor/preact_absmean", "motor/out_mean",
+    "motor/preact_mean", "motor/param_drift", "motor/msg_param_drift",
+    "motor/log_std", "policy/log_std_mean", "policy/std_mean",
+    "ppo/actor_grad_norm", "ppo/critic_grad_norm",
+    "ppo/adv_mean", "ppo/adv_std", "ppo/mean_value", "ppo/mean_return",
+    "ppo/return_std",
+    "time/env_step_sec", "time/step_sec", "time/parse_sec",
+    "time/getsteps_sec", "time/parse_msgs", "time/snapshots_sec",
+    "time/act_sec", "time/collect_sec", "time/ppo_sec",
+    "episodes/count", "episodes/mean_length", "episodes/mean_final_coverage",
+    "rollout/mean_step_reward", "rollout/success_rate",
+    "rollout/mean_final_coverage", "rollout/mean_episode_length",
+    "rollout/decisions",
+}
+
+# In reward_mode="target" the any-pixel income is not part of the reward
+# (only its diagnostic on_fraction survives, renamed above), so its component
+# charts would chart a term that pays nothing.
+TB_TARGET_MODE_DROP = {"reward/on_bonus_mean", "reward/pack_mean", "reward/off_pen_mean"}
+
+
+def tb_view(stats, cfg):
+    """The curated TensorBoard projection of a full stats dict.
+
+    Unknown keys PASS THROUGH (so bc/*, oracle/* and any future tag stays
+    visible by default); only the explicit drop sets above are removed, and
+    the rename map puts the run's charts into one reading order: objective,
+    reward, optim, grads, policy, diag, time.
+    """
+    mode_drop = TB_TARGET_MODE_DROP if getattr(cfg, "reward_mode", "normal") == "target" else set()
+    out = {}
+    for key, value in stats.items():
+        if key in TB_DROP or key in mode_drop:
+            continue
+        out[TB_RENAME.get(key, key)] = value
+    return out
 
 
 def merge_stats(ppo_logs, timing, rollout_metrics):
@@ -228,6 +366,8 @@ def merge_stats(ppo_logs, timing, rollout_metrics):
              "motor/log_std": ppo_logs["log_std_motor"],
              "policy/log_std_mean": ppo_logs["log_std_mean"],
              "policy/std_mean": ppo_logs["std_mean"],
+             "policy/std_msg": ppo_logs.get("std_msg", 0.0),
+             "policy/std_motor": ppo_logs.get("std_motor_eff", 0.0),
              "time/iter_seconds": timing["iter_seconds"],
              "time/steps_per_sec": timing["rollout_steps"] / timing["iter_seconds"] if timing["iter_seconds"] > 0 else 0.0,
              "time/env_step_sec": timing["env_step_sec"],

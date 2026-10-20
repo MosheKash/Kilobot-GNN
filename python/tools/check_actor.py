@@ -22,12 +22,33 @@ from bc_replay import BC_STATES
 
 cfg = Config()
 cfg.actor_type = "gru_split_observation"
-cfg.use_arrived_head = True
-cfg.use_turn_anchor = True
-policy = GaussianPolicy(build_actor(cfg), cfg.log_std_init)
 ck = torch.load(sys.argv[1], map_location = "cpu", weights_only = False)
-policy.actor.load_state_dict(ck["actor"])
+# Accept a bare actor export ("actor" key) or a full training checkpoint
+# ("policy" key, whose actor keys are prefixed with "actor."). The heads are
+# detected from the state_dict itself rather than hardcoded: an RL
+# checkpoint's meta predates checkpoint.architecture_meta, so the flags are
+# not in meta and the tensor keys are the only source of truth.
+sd = ck["actor"] if "actor" in ck else ck["policy"]
+prefixed = any(k.startswith("actor.") for k in sd)
+if prefixed:
+    sd = {k.split("actor.", 1)[1]: v for k, v in sd.items() if k.startswith("actor.")}
+if "head_arrived.weight" in sd:
+    cfg.use_arrived_head = True
+if "head_state.weight" in sd:
+    cfg.use_state_head = True
+if "head_wall.weight" in sd:
+    cfg.use_wall_head = True
+if "up1.weight" in sd:
+    from kilobot_gnn import SPLIT_TC_SIZE, SPLIT_ODOM_SIZE
+    cfg.use_turn_anchor = bool(int(sd["up1.weight"].shape[1]) == SPLIT_TC_SIZE + SPLIT_ODOM_SIZE + 2)
+if "activation" in (ck.get("meta") or {}):
+    cfg.split_activation = ck["meta"]["activation"]
+policy = GaussianPolicy(build_actor(cfg), cfg.log_std_init)
+policy.actor.load_state_dict(sd)
 tape = load_tape(sys.argv[2])
+# tapes are recorded float16 (val_tape.py's format); the model is float32
+tape = {k: (v.float() if torch.is_tensor(v) and v.is_floating_point() else v)
+        for k, v in tape.items()}
 
 actor = policy.actor
 T, R = tape["valid"].shape

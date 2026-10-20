@@ -20,8 +20,9 @@ import torch
 from belief import (belief_read, belief_conf, belief_track_anchor, ANCHOR_STATE_SIZE,
                     ARENA_HALF, LOCALIZED_CONF_THRESHOLD, SEED_LAYOUTS, HEADING_NOISE_SCALE,
                     _matched_generator)
-from kilobot_gnn import SEED_SIZE, WALL_SIZE, MESSAGE_SIZE, MOTOR_SIZE, NODE_FEATURES, priv_cols, SPLIT_SEED_OFFSET, SPLIT_WALL_OFFSET, closed_form_arrived
+from kilobot_gnn import SEED_SIZE, WALL_SIZE, MESSAGE_SIZE, MOTOR_SIZE, NODE_FEATURES, priv_cols, SPLIT_SEED_OFFSET, SPLIT_WALL_OFFSET, closed_form_arrived, PROP_DIST_T, PROP_CONF_POS
 from kinematics import dead_reckon, split_tick_motion, split_track_update, split_track_read
+import evidence
 import observation
 # re-exported: these used to be defined in this module and other modules still
 # reach for them at actor_io's own path
@@ -474,7 +475,52 @@ def _write_claim_broadcast(action_row, worker, a, l, arrived):
         action_row[7] = 0.0
 
 
-def _arrived_head_gate(worker, policy, cfg, a, l, idx, closed_form = None):
+def _arrival_gate_protection(worker, cfg, a, l, fire):
+    """Persistence + anchoring protection on a NEW arrival-latch transition.
+
+    Where the measured failure lives (docs/tuning.md phase 168, the with-comms
+    eval decomposition): a freshly fused peer ring both inflates the filter's
+    conf and biases its mean, and the closed-form gate fires terminally on the
+    inflated conf while the mean is still off -- with comms live, 0.49 of
+    robots stopped WRONG against 0.28 with the channel off. Two conditions,
+    each cheap:
+
+    - cfg.arrival_min_anchored: the robot must have had one DIRECT seed/wall
+      sighting this episode (worker.belief_ever_anchored, set in act() from
+      the same observation the filter consumes). Chained peer claims alone
+      are hearsay; a terminal stop on hearsay is how a wrong beacon
+      propagates one hop per victim.
+    - cfg.arrival_persist: the condition must hold on this many consecutive
+      decisions. A conf pumped up by this tick's ring is transient; a belief
+      genuinely parked on its pixel keeps satisfying the condition.
+
+    An already-off robot is never re-tested by the caller, so this never
+    releases a latch -- it only delays new ones. The counter resets whenever
+    the condition stops holding, so "consecutive" is real.
+    """
+    persist_needed = int(getattr(cfg, "arrival_persist", 1) or 1)
+    need_anchored = bool(getattr(cfg, "arrival_min_anchored", False))
+    if persist_needed <= 1 and not need_anchored:
+        return fire
+    if not hasattr(worker, "_arrival_persist"):
+        worker._arrival_persist = {}
+    persist = worker._arrival_persist.setdefault(a, {})
+    if not fire:
+        if l in persist:
+            persist[l] = 0
+        return False
+    if need_anchored and not worker.belief_ever_anchored.get(a, {}).get(l, False):
+        persist[l] = 0
+        return False
+    if persist_needed > 1:
+        persist[l] = persist.get(l, 0) + 1
+        if persist[l] < persist_needed:
+            return False
+    return True
+
+
+def _arrived_head_gate(worker, policy, cfg, a, l, idx, closed_form = None,
+                       prop_dist = None, prop_conf = None):
     """Whether the actor's arrival rule has switched this robot off.
 
     config.py's own use_arrived_head has the full rationale for the learned
@@ -503,12 +549,26 @@ def _arrived_head_gate(worker, policy, cfg, a, l, idx, closed_form = None):
     With cfg.closed_form_and_gate the two run in AND: a robot stops only when
     the closed form AND the learned head both fire. This is the conservative
     complement of hybrid -- nobody stops on a single detector's vote.
+
+    cfg.closed_form_release (KILOBOT_CLOSED_FORM_RELEASE, default off) removes
+    the closed-form branch's terminality: a LATCHED robot stays off only while
+    the closed form still holds. The learned head is deliberately excluded
+    from the stay rule -- measured (KILOBOT_RELEASE_DEBUG): it saturates at
+    p=1.000 on every already-off evaluation, keying on the parked observation
+    itself, so it is a slave to the latch and can never vote to release.
+    Measured reason for the change at all (the S1b diagnostic): 59% of
+    wrong-stopped robots no longer satisfied the gate at final (conf median
+    0.20 vs 0.80 for settled-right; some believed 16-35u from their pixel) --
+    parked on a latch their own current belief would refuse, broadcasting a
+    position they no longer hold under beacon_arrived_only, and unrecoverable.
+    Off (the default) keeps the historical terminal behaviour bit-for-bit.
     """
     if cfg.motor_override != "none":
         return False
     if not hasattr(worker, "arrived_switched_off"):
         worker.arrived_switched_off = {}
     already_off = worker.arrived_switched_off.get(a, {}).get(l, False)
+    release = float(getattr(cfg, "arrived_release_threshold", 0.0))
     if getattr(cfg, "use_closed_form_arrived", False):
         if closed_form is None:
             return False
@@ -520,17 +580,62 @@ def _arrived_head_gate(worker, policy, cfg, a, l, idx, closed_form = None):
             fire = bool(closed_form[idx]) or bool(p_arrived > cfg.arrived_confidence_threshold)
         else:
             fire = bool(closed_form[idx])
-        still_off = already_off or fire
+        if already_off and getattr(cfg, "closed_form_release", False):
+            # Release v3, STRONG REPUDIATION ONLY. Two measured negatives
+            # shaped this rule. (1) The first release design (stay while the
+            # closed form holds) churned 55,890 release decisions in one
+            # episode and LOST 0.16 settled: settled robots' conf dips below
+            # the 0.4 gate floor often enough that plain re-testing wakes
+            # them (29 previously-settled robots disturbed vs 12 wrong stops
+            # fixed), and a moving robot's filter loses confidence, so a
+            # released robot cannot re-reach the parked-robot latch floor --
+            # a poverty trap (moving went 0.043 -> 0.262). (2) The learned
+            # head can never be release evidence: KILOBOT_RELEASE_DEBUG
+            # measured it saturated at p=1.000 on 786/786 already-off
+            # evaluations -- it keys on the parked observation itself, a
+            # slave to the latch. So v3 wakes a robot ONLY when its own
+            # belief ACTIVELY REPUDIATES the parking spot: confidence
+            # collapsed below release_repudiate_conf AND the believed
+            # distance to its target beyond release_repudiate_dist (the S1b
+            # diagnostic's 16-35u population). Borderline-conf and
+            # believed-close robots stay parked whatever the head says;
+            # re-latching runs the full protected fire path below.
+            repudiate = False
+            if prop_dist is not None and prop_conf is not None:
+                repudiate = (float(prop_conf) < float(getattr(cfg, "release_repudiate_conf", 0.15))
+                             and float(prop_dist) > float(getattr(cfg, "release_repudiate_dist", 0.12)))
+            import os as _os
+            if _os.environ.get("KILOBOT_RELEASE_DEBUG") and repudiate:
+                import sys as _sys
+                print(f"[release] WAKE: conf={float(prop_conf):.3f} believed_dist={float(prop_dist):.3f} "
+                      f"(p={p_arrived:.3f})",
+                      file=_sys.stderr, flush=True)
+            still_off = not repudiate
+        else:
+            if fire and not already_off:
+                fire = _arrival_gate_protection(worker, cfg, a, l, fire)
+            still_off = already_off or fire
     else:
         if policy.actor.head_arrived is None:
             return False
         p_arrived = torch.sigmoid(policy.actor._arrived_logit[idx]).item()
-        release = float(getattr(cfg, "arrived_release_threshold", 0.0))
         if already_off:
             still_off = True if release <= 0.0 else (p_arrived >= release)
         else:
             still_off = p_arrived > cfg.arrived_confidence_threshold
+            if still_off:
+                still_off = _arrival_gate_protection(worker, cfg, a, l, True)
     worker.arrived_switched_off.setdefault(a, {})[l] = still_off
+    # The False->True latch transition, consumed one tick later by
+    # trainer._record_snapshots' stop bonus (docs/tuning.md phase 164):
+    # conditionally paid on the robot's TRUE distance to its own assigned
+    # target, so a gate false positive buys nothing. Only reachable in
+    # actor-driving modes (the early return above), and only when the
+    # transition is new -- an already-off robot re-latching pays nothing.
+    if still_off and not already_off:
+        if not hasattr(worker, "pending_stop_bonus"):
+            worker.pending_stop_bonus = {}
+        worker.pending_stop_bonus.setdefault(a, {})[l] = True
 
     # Purely visual, and off unless cfg.oracle_send_visual_state is set. Reuses
     # the existing visual-state channel: state 4 is already "arrived, stopped ->
@@ -596,6 +701,20 @@ def act(buffer, policy, worker, decision_steps, cfg, rng, deterministic = False,
     # sighting counts the same way: it is a real environment event even for
     # actors that do not consume that channel themselves
     has_seed = (seeds.sum(dim=1) > 0) | (walls.sum(dim=1) > 0)
+
+    # cfg.arrival_min_anchored: per-robot "has EVER had a direct seed/wall
+    # sighting this episode", from the same full observation channels the
+    # belief filter itself consumes on decision ticks (has_seed above -- not
+    # the narrowed single-event draw, which would under-report what the robot
+    # physically saw and what its filter was fed). Updated before any arrival
+    # gate runs, so the gate reads this tick's own sighting too. Only
+    # decision ticks are tracked, which is exactly the ticks the filter ever
+    # updates on, so the flag cannot disagree with what the filter knows.
+    if getattr(cfg, "arrival_min_anchored", False):
+        if not hasattr(worker, "belief_ever_anchored"):
+            worker.belief_ever_anchored = {}
+        for i in torch.nonzero(has_seed).flatten().tolist():
+            worker.belief_ever_anchored.setdefault(int(arena_ids[i]), {})[int(locals_[i])] = True
 
     if not split_obs_actor:
         cols = priv_cols(cfg.actor_priv_mode)
@@ -728,11 +847,141 @@ def act(buffer, policy, worker, decision_steps, cfg, rng, deterministic = False,
         a = int(arena_ids[idx])
         l = int(locals_[idx])
         actions[idx] = env_action[idx].detach().cpu()
-        if split_obs_actor and getattr(cfg, "belief_comms", False):
-            actions[idx][0] = float(prop_b[idx][8])
-            actions[idx][1] = float(prop_b[idx][9])
-            actions[idx][2] = float(prop_b[idx][12] * prop_b[idx][13])
-        if split_obs_actor and claim_broadcast:
+        # The arrival gate runs BEFORE the beacon write, not after: with
+        # cfg.beacon_arrived_only the beacon must carry the robot's
+        # PROTECTED latch state as of this decision (a robot the gate is
+        # still refusing to confirm must not broadcast a position other
+        # robots will range off). The gate's own side effects (latch update,
+        # pending stop bonus) are unchanged by the move -- nothing between
+        # the old and new positions read them.
+        stopped = None
+        if split_obs_actor:
+            stopped = _arrived_head_gate(worker, policy, cfg, a, l, idx, closed_form = cf_arrived,
+                                         prop_dist = float(prop_b[idx, PROP_DIST_T]),
+                                         prop_conf = float(prop_b[idx, PROP_CONF_POS]))
+        # config.belief_comms_learned: with belief_comms on but the beacon
+        # NOT hard-written here, the policy's own message-head outputs are
+        # what receivers' filters fuse (reward.belief_errors /
+        # arena_potential close the loop on the sender's side: a true,
+        # high-conf broadcast shrinks receivers' belief errors and raises the
+        # shared arena potential -- the sender's own return with it; garbage
+        # or low-conf output is either ignored by add_peer_range's PEER_CONF_MIN
+        # gate or actively grows the error). Default keeps the historical
+        # honest-beacon override exactly as it was.
+        # config.hop_comms: the robust hop-count protocol (docs in config.py
+        # and observation.hop_flood_update). Overrides the WHOLE message: slots
+        # 0..SEED_SIZE-1 carry the robot's hop counts (slot = k+1, 0 =
+        # silent/unknown), slots SEED_SIZE.. get zeroed so the wire carries no
+        # leftover policy content. The flood is state the mission engenders
+        # (min-relaxation over received rows), not a learned claim -- a stopped
+        # robot keeps relaying, since graph distance is meaningful for parked
+        # robots too.
+        if (split_obs_actor and getattr(cfg, "hop_comms", False)):
+            hp = worker.hop.get(a, {}).get(l) if hasattr(worker, "hop") else None
+            for s in range(MESSAGE_SIZE):
+                actions[idx][s] = 0.0
+            if hp is not None:
+                for s in range(min(SEED_SIZE, len(hp))):
+                    if hp[s] >= 0:
+                        actions[idx][s] = float(hp[s] + 1)
+        elif (split_obs_actor and getattr(cfg, "belief_comms", False)
+                and not getattr(cfg, "belief_comms_learned", False)):
+            # cfg.beacon_arrived_only: moving robots stay SILENT, explicitly
+            # zeroed -- a head_msg output left in slots 0-2 would be random
+            # noise that can clear PEER_CONF_MIN and fuse a garbage ring into
+            # every nearby receiver's filter, which is worse than no channel
+            # at all. A robot whose (protected) arrival latch has fired
+            # broadcasts its believed position: it has stopped, accumulates
+            # no further dead-reckoning drift, and its claim is accurate to
+            # ~the settle radius -- a mobile seed, not gossip.
+            min_conf = float(getattr(cfg, "beacon_anchored_min_conf", 0.0) or 0.0)
+            if min_conf > 0.0:
+                # Stage 2b sender gate: broadcast from OUT IN THE ARENA, not
+                # only from the shape. Eligibility = anchored this episode
+                # (one direct seed/wall sighting -- no chained hearsay) AND
+                # own belief confidence at or above the bar. Measured reason
+                # (S2a): the arrived-only sender pool is geometrically
+                # separated from the receivers that need it -- senders
+                # cluster at the shape, receivers-in-need are mid-arena, and
+                # 7u IR cannot bridge it, so widening the receiver gate
+                # (0.85 -> 0.70/0.60) changed nothing. Content stays the
+                # honest readout (x_m, y_m, conf_pos*r); the receiver's
+                # sigma is derived from the sender's own confidence, so a
+                # mid-conf sender carries proportionally wide sigma -- soft
+                # evidence, not a claim. Takes precedence over
+                # beacon_arrived_only when set.
+                anchored = worker.belief_ever_anchored.get(a, {}).get(l, False)
+                if (not anchored) or float(prop_b[idx][PROP_CONF_POS]) < min_conf:
+                    actions[idx][0] = 0.0
+                    actions[idx][1] = 0.0
+                    actions[idx][2] = 0.0
+                else:
+                    actions[idx][0] = float(prop_b[idx][8])
+                    actions[idx][1] = float(prop_b[idx][9])
+                    actions[idx][2] = float(prop_b[idx][12] * prop_b[idx][13])
+            elif getattr(cfg, "beacon_arrived_only", False) and not stopped:
+                actions[idx][0] = 0.0
+                actions[idx][1] = 0.0
+                actions[idx][2] = 0.0
+            else:
+                actions[idx][0] = float(prop_b[idx][8])
+                actions[idx][1] = float(prop_b[idx][9])
+                actions[idx][2] = float(prop_b[idx][12] * prop_b[idx][13])
+        if split_obs_actor and getattr(cfg, "evidence_comms", False):
+            # The evidence channel's writer floor (evidence.py's design):
+            # slots 3-5 carry this robot's last DIRECT sighting -- a raw
+            # measurement record, not a posterior, so its eligibility is the
+            # sighting's own freshness, NOT the beacon's confidence bar (a
+            # low-conf robot that just touched a wall genuinely has evidence
+            # worth referring). Slots 6-8: zeroed unless learned_veto is
+            # live, in which case slot 6 stays the policy's own veto sample
+            # (checked below); the wire carries protocol content plus, at
+            # most, the policy's right to stay silent.
+            sight = getattr(worker, "last_sighting", {}).get((a, l))
+            horizon = float(getattr(cfg, "disclosure_recency_ticks", 2000))
+            now = int(worker.step_count.get(a, 0))
+            if sight is not None and (now - sight[2]) <= horizon:
+                recency = max(0.0, 1.0 - (now - sight[2]) / horizon)
+                (actions[idx][3], actions[idx][4],
+                 actions[idx][5]) = evidence.encode_disclosure(sight[0], sight[1], recency)
+            else:
+                actions[idx][3] = 0.0
+                actions[idx][4] = 0.0
+                actions[idx][5] = 0.0
+            if not getattr(cfg, "learned_veto", False):
+                actions[idx][6] = 0.0
+            if getattr(cfg, "learned_self_trust", False):
+                # T2b: slot 7 carries the policy's graded self-trust
+                # annotation (post-squash sample in [-1,1]; the receiver maps
+                # it one-sidedly: 1 + min(0, t), so anything non-negative is
+                # a no-op and only negative samples demote the sender's own
+                # claim). The init keeps the mean at +2.0, i.e. iteration 0
+                # behaves exactly like T1/T2a.
+                pass   # keep the policy's sample in slot 7
+            else:
+                actions[idx][7] = 0.0
+            actions[idx][8] = 0.0
+            if getattr(cfg, "learned_veto", False) and float(actions[idx][6]) < 0.0:
+                # the policy's veto: silence the whole row. Content stays
+                # env-written; this is the one channel-side power the policy
+                # has, and it can only reduce what is said.
+                actions[idx][0:9] = 0.0
+        if getattr(cfg, "recv_gate", False):
+            # The learned receiver's trust output: the robot's OWN message
+            # slot 3, post-squash in [-1,1], mapped to a gate g in [0,1]
+            # that next tick scales this robot's fused-ring sigma by 1/g
+            # (observation.py -> belief.add_peer_range). Slot 3 is free
+            # real estate -- the honest beacon writes 0-2 and the
+            # supervision prior targets 0-2 only, so the policy's slot-3
+            # sample is exclusively the receiver's trust signal. Stored
+            # per-robot between decisions; reset with the other per-robot
+            # caches in trainer._reset_arena.
+            if not hasattr(worker, "recv_gate"):
+                worker.recv_gate = {}
+            worker.recv_gate.setdefault(a, {})[l] = float(0.5 * (actions[idx][3] + 1.0))
+        if split_obs_actor and claim_broadcast and not getattr(cfg, "evidence_comms", False):
+            # claim_broadcast's slots 3-7 are retired under evidence_comms
+            # (the disclosure owns 3-5); the writer stays for the legacy mode.
             if stopped_mask is not None:
                 arrived_now = bool(stopped_mask[idx])
             else:
@@ -763,7 +1012,8 @@ def act(buffer, policy, worker, decision_steps, cfg, rng, deterministic = False,
         # while its bc_target was still go_north's [1.0, 1.0].
         was_turning = bool(oracle_state == "turning")
         if split_obs_actor:
-            stopped = _arrived_head_gate(worker, policy, cfg, a, l, idx, closed_form = cf_arrived)
+            # stopped was computed above, before the beacon write -- the
+            # gate's side effects are identical, only its position moved.
             # Skipped when stopped: keeps h_prev at whatever it was when the
             # robot switched off, rather than letting the GRU keep evolving over
             # a long run of near-identical arrived observations, which drives
@@ -843,6 +1093,23 @@ def act(buffer, policy, worker, decision_steps, cfg, rng, deterministic = False,
 
     if scripted is not None:
         actions[:, MESSAGE_SIZE:] = scripted
+
+    # T1b's scripted homing (config.referral_homing): Gate 2's controller at
+    # pipeline scale. Fires ONLY for lost robots (own conf < 0.4 -- the
+    # arrival gate's own bar) holding a fresh referral with a trustworthy
+    # strength-law fit; every other robot's policy motors pass untouched.
+    # Applied before the arrived-switch-off zeroing below so a latched robot
+    # can never be woken by a referral, and after `scripted` so an
+    # oracle-driven run keeps its teacher's motors.
+    if split_obs_actor and getattr(cfg, "referral_homing", False):
+        for i in range(len(arena_ids)):
+            a, l = int(arena_ids[i]), int(locals_[i])
+            if float(prop_b[i][PROP_CONF_POS]) >= 0.4:
+                continue
+            motors = evidence.homing_motor_override(worker, a, l, cfg)
+            if motors is not None:
+                actions[i, MESSAGE_SIZE] = motors[0]
+                actions[i, MESSAGE_SIZE + 1] = motors[1]
 
     # config.py's own use_arrived_head has the full rationale. Applied to
     # every row, not just this tick's active deciders, since a

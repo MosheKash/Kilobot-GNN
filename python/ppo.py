@@ -163,6 +163,13 @@ def ppo_update(policy, critic, actor_opt, critic_opt, buffer, cfg):
     logs["mean_value"] = _mean_cat(buffer.values)
     logs["mean_return"] = _mean_cat(buffer.returns)
     logs["return_std"] = _std_cat(buffer.returns)
+    # EFFECTIVE per-kind std (after the clamp stack, including any
+    # KILOBOT_MSG_LOG_STD_MAX message cap) -- what actually shaped the
+    # samples this iteration, unlike the raw parameter means above.
+    with torch.no_grad():
+        std_eff = policy._std()
+        logs["std_msg"] = float(std_eff[:MESSAGE_SIZE].mean())
+        logs["std_motor_eff"] = float(std_eff[MESSAGE_SIZE:].mean())
 
     # Parameter drift over this iteration: how far the motor-producing params actually
     # moved under the gradient, vs the message params of the same layer. A healthy motor
@@ -186,10 +193,11 @@ def _actor_loss(policy, data, advantages, chunk, cfg):
     old_lp = data["old_lp"][chunk]
     adv = advantages[chunk]
 
+    mean = None
     if getattr(cfg, "actor_type", None) == "gru_split_observation":
         h_prev = data["prev_hidden"][chunk]
         prop = data["prop"][chunk]
-        log_prob, entropy = policy.evaluate_batch_split(tx, prop, h_prev, action)
+        log_prob, entropy, mean = policy.evaluate_batch_split(tx, prop, h_prev, action)
     elif "prev_hidden" in data:
         msg = tx[:, :MESSAGE_SIZE]
         h_prev = data["prev_hidden"][chunk]
@@ -208,6 +216,44 @@ def _actor_loss(policy, data, advantages, chunk, cfg):
 
     entropy_mean = entropy.mean()
     loss = -torch.min(unclipped, clipped).mean() - cfg.entropy_coef * entropy_mean
+
+    # Auxiliary supervision of the learned beacon (the transmission phase).
+    # The message head must broadcast its own believed position and
+    # confidence -- slots 0-2, exactly what actor_io's honest-beacon override
+    # force-writes when belief_comms_learned is off. Without a prior the
+    # beacon can never switch on: the receiver-side fusion gate needs the
+    # squashed conf past PEER_CONF_MIN=0.85, i.e. a pre-tanh mean above
+    # ~1.73, unreachable from a quiet start (entropy explores amplitude, not
+    # offset). The target comes from the decision's OWN stored prop (x_m,
+    # y_m at [8]/[9], conf_pos*r at [12]*[13] -- the same columns the
+    # override reads). The head is evaluated through
+    # kilobot_gnn.message_mean_headonly, so the prior's gradient reaches
+    # head_msg and STOPS: a trunk-connected supervision was measured to
+    # wreck the warm start within five iterations (kl 7/iter, belief error
+    # 0.62 -> 0.82) because the trunk is the motor policy. The weight is a
+    # prior, not a cage (the oracle_residual pattern): the PPO surrogate's
+    # own, trust-region-clipped gradient still shapes the protocol through
+    # everything.
+    sup_w = float(getattr(cfg, "msg_supervision", 0.0))
+    if (sup_w > 0.0 and getattr(cfg, "actor_type", None) == "gru_split_observation"
+            and "prop" in data):
+        from kilobot_gnn import message_mean_headonly
+        prop = data["prop"][chunk]
+        sup_mean = message_mean_headonly(policy.actor, tx, prop, h_prev)
+        # Supervised in ACTION space, deliberately NOT pre-tanh: the readout
+        # initialization already sits near the honest beacon, and an atanh
+        # target (up to 3.8 for conf ~ 0.999) would systematically grind the
+        # conf mean ~1.8 units uphill through a std-0.05 Gaussian -- measured
+        # as kl 1->10 per iteration before this switch, the ratio exploding
+        # on exactly the slot that was already right. In action space the
+        # gradient decays with tanh saturation, so the prior corrects real
+        # errors and leaves saturated slots alone.
+        tgt = torch.stack([
+            prop[:, 8].clamp(-0.999, 0.999),
+            prop[:, 9].clamp(-0.999, 0.999),
+            (prop[:, 12] * prop[:, 13]).clamp(0.0, 0.999)], dim=1)
+        msg_loss = ((torch.tanh(sup_mean[:, :3]) - tgt) ** 2).mean()
+        loss = loss + sup_w * msg_loss
 
     kl_total = float((ratio - 1.0 - log_ratio).detach().sum())
     out = (ratio > 1.0 + cfg.clip) | (ratio < 1.0 - cfg.clip)

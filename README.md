@@ -8,11 +8,11 @@ Unity runs the physics and the infrared messaging. All the learning happens in P
 
 A research work in progress. The pipeline runs end to end — collect rollouts, train an actor and critic with MAPPO, checkpoint, resume, export, evaluate — but it does **not** yet converge to reliable shape assembly, and that is the current focus.
 
-The current approach is a two-stage one: behaviour-clone a scripted teacher (`python/simple_oracle.py`, a five-state machine that uses no privileged information), then fine-tune with RL from that warm start.
+The current approach is a two-stage one: behaviour-clone a scripted teacher (`python/simple_oracle.py`, a five-state machine that uses no privileged information), then fine-tune with RL from that warm start. As of phase 170 (docs/tuning.md) the best measured artifact is the **frozen BC clone + the arrival-gate protection stack** ("A7": settled<5u 0.671 ± 0.015 on the paired harness), and the learned-transmission channel is a completed, controlled negative — measured out on every route, with the mechanism identified at each failure.
 
 The investigation is long and is documented rather than summarised here:
 
-- **[`docs/tuning.md`](docs/tuning.md)** — the chronological research log, phase by phase. The last entries are where things currently stand.
+- **[`docs/tuning.md`](docs/tuning.md)** — the chronological research log, phase by phase. The last entries are where things currently stand, ending with a **Handover** section (state of play, measured exclusions, artifact inventory, infrastructure facts, and the standing constraints).
 - **[`docs/code-history.md`](docs/code-history.md)** — the same material indexed by symbol: why a given constant, flag or sign is what it is.
 
 Treat this as a working research codebase, not a finished product.
@@ -116,6 +116,14 @@ env KILOBOT_MODE=rl KILOBOT_SMOKE=0 KILOBOT_ITERATIONS=200 KILOBOT_DEVICE=cuda \
 ```
 
 `KILOBOT_REWARD_SHAPING` and `KILOBOT_ENTROPY_COEF` are set explicitly because both defaults were *measured* to prevent progress (`docs/tuning.md`): shaping is off by default and is the only gradient a robot far from the target gets, and the default entropy coefficient drives action noise to its ceiling within the first third of a run.
+
+**RL with a trained transmission policy** (phase 168 — the first RL recipe that does not collapse the warm start; five root causes fixed, see `docs/tuning.md`):
+
+```
+./scripts/train_rl_transmission.sh 100 ../results/rl_transmission    # iterations, out dir
+```
+
+Warm-starts from the BC clone, installs an honest beacon as the message head's initialization (readout of the robot's own filter state), and fine-tunes with the correctness-grounded belief-error reward terms. Without the comms channel the fine-tune beats the clone (settled<5u 0.677 vs 0.631); with the channel live, localization accelerates but final settle rate currently pays for it — the measured attribution is in the phase-168 entry. Phase 169 (stage A) then decomposed the harm eval-only: ring fusion is the entire residual cost, the input shift is worth 0.008, and the new arrival-latch protection alone lifts the clone to 0.691 settled / 0.310 @ tick-4000 — the baseline the transmission stage must now beat *with* the channel live.
 
 **Watch it run** (needs a separate headed build — see `docs/development.md`):
 

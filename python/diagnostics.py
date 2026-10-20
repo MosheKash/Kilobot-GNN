@@ -100,7 +100,7 @@ def audit_replay_ratio(policy, cfg, buf):
     actor_type = getattr(cfg, "actor_type", "deepset")
     with torch.no_grad():
         if actor_type == "gru_split_observation":
-            new_lp, _ = policy.evaluate_batch_split(tx, data["prop"], data["prev_hidden"], data["action"])
+            new_lp, _, _ = policy.evaluate_batch_split(tx, data["prop"], data["prev_hidden"], data["action"])
         elif actor_type == "gru":
             new_lp, _ = policy.evaluate_batch_gru(data["z"], data["seed"], tx[:, :MSG], data["prop"],
                                                    data["prev_hidden"], data["action"])

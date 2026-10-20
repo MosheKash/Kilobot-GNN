@@ -17,9 +17,13 @@ import actor_io
 from belief import belief_read, belief_population_stats, _matched_generator
 from kilobot_gnn import MESSAGE_SIZE
 from buffer import RolloutBuffer
-from reward import compute_rewards, coverage, reward_components, belief_confidence_bonus, seed_wall_find_reward
+from reward import (compute_rewards, coverage, reward_components, belief_confidence_bonus,
+                    seed_wall_find_reward, assigned_target_dists, separation_reward,
+                    accuracy_income, target_kernel,
+                    belief_errors, arena_potential, honest_confidences,
+                    beacon_overclaim_penalty)
 from ppo import ppo_update
-from metrics import Logger, rollout_stats, build_histograms, merge_stats
+from metrics import Logger, rollout_stats, build_histograms, merge_stats, tb_view
 from env_worker import EnvWorker
 from checkpoint import save_checkpoint, export_actor
 
@@ -100,8 +104,20 @@ def shaping_schedule(base, iterations, it):
     return 0.0
 
 
-def check_startup_coverage(stats, min_start_cov):
+def check_startup_coverage(stats, min_start_cov, success_metric="coverage"):
     cov0 = stats.get("rollout/mean_coverage", 0.0)
+    # Under success_metric=settled the mean_coverage value IS the settled
+    # fraction, and a spawn value near zero is EXPECTED -- a robot dropped at
+    # random is rarely within stop_radius of ITS OWN assigned point (the
+    # 0.286 chance floor belongs to any-pixel coverage, which this is not).
+    # The "encoder or formations may not have loaded" warning does not apply
+    # to it; only the explicit min_start_cov abort is honoured, and that is
+    # the operator's own chosen bar.
+    if success_metric == "settled":
+        if min_start_cov > 0.0 and cov0 < min_start_cov:
+            raise RuntimeError("iter-0 settled fraction %.3f below KILOBOT_MIN_START_COV %.3f; aborting"
+                               % (cov0, min_start_cov))
+        return
     if cov0 < 0.05:
         print("  WARNING: iter-0 mean coverage %.3f is near zero - the encoder or "
               "formations may not have loaded correctly" % cov0)
@@ -148,6 +164,7 @@ class Trainer:
         self._pool = None
         self._critic_extra = critic_extra_features(self.cfg)
         belief_mod.set_layout(getattr(self.cfg, "seed_layout", "corners"))
+        belief_mod.set_peer_conf_min(getattr(self.cfg, "peer_conf_min", 0.85))
         if getattr(self.cfg, "actor_type", None) == "gru_split_observation" and getattr(self.cfg, "heartbeat_ticks", 0) <= 0:
             print("WARNING: gru_split_observation with heartbeat_ticks=0 (the default). A robot that "
                   "never comes into range of a seed, wall seed, or neighbor never gets a single decision "
@@ -247,6 +264,16 @@ class Trainer:
             worker.prev_dist.pop(k, None)
         if hasattr(worker, "prev_pos"):
             worker.prev_pos.pop(k, None)
+        if hasattr(worker, "prev_target_dist"):
+            worker.prev_target_dist.pop(k, None)
+        if hasattr(worker, "prev_global_pot"):
+            worker.prev_global_pot.pop(k, None)
+        if hasattr(worker, "prev_belief_err"):
+            worker.prev_belief_err.pop(k, None)
+        if hasattr(worker, "pending_stop_bonus"):
+            worker.pending_stop_bonus[k] = {}
+        if hasattr(worker, "stop_bonus_paid"):
+            worker.stop_bonus_paid[k] = {}
         if hasattr(worker, "oracle_ever_localized"):
             worker.oracle_ever_localized[k] = {}
         if hasattr(worker, "oracle_facing"):
@@ -290,6 +317,56 @@ class Trainer:
         # established elsewhere as a genuine, swarm-wide reset.
         if hasattr(worker, "arrived_switched_off"):
             worker.arrived_switched_off[k] = {}
+        # The per-robot caches that accumulated AFTER this list was written.
+        # A genuine, confirmed leak (the episode-2 collapse of the first
+        # transmission run: belief error ABOVE spawn level from tick one of
+        # every episode after the first): _reset_arena reuses local indices
+        # for brand-new robots, so a stale entry hands the new robot the OLD
+        # robot's spawn heading (with oracle_known_start_heading the filter
+        # is then TOLD a wrong heading and can never localize -- measured
+        # berr 1.1 vs episode 1's 0.20), the previous robot's turn anchor
+        # (the network steers turns by it), or the previous robot's
+        # fit/anchor EMA state. Eval harnesses never reset arenas, which is
+        # why only training runs ever saw this.
+        for attr in ("_spawn_heading_cache", "turn_anchor", "turn_anchor_set_tick",
+                     "belief_fit", "belief_anchor", "_stable_belief_heading",
+                     "_last_ac_injection_tick", "_predict_update_debug_seen",
+                     "_wall_debug_seen",
+                     # arrival-gate protection state (actor_io._arrival_gate_
+                     # protection / belief_ever_anchored): same leak family as
+                     # _spawn_heading_cache above -- a stale "ever anchored" or
+                     # a stale persistence count is the PREVIOUS robot's
+                     # evidence, and would let a fresh robot latch (or be
+                     # refused) on it.
+                     "belief_ever_anchored", "_arrival_persist",
+                     # the peer fix's per-robot injection cooldown (belief.
+                     # add_peer_fix): a stale tick stamp is the previous
+                     # robot's cooldown, suppressing or mis-timing the new
+                     # robot's first fix hypothesis.
+                     "_peer_inject_tick",
+                     # the hop-count flood's per-robot counters
+                     # (observation.hop_flood_update / config.hop_comms): a
+                     # stale entry is the previous robot's graph distances,
+                     # handing a fresh robot a confidence it never earned.
+                     "hop",
+                     # the learned receiver's trust gate (config.recv_gate):
+                     # a stale entry is the previous robot's fusion trust.
+                     "recv_gate",
+                     # the Gate-1 encounter probe's per-robot counters
+                     # (config.encounter_probe): a stale entry is the
+                     # previous robot's reception history.
+                     "_encounter_probe",
+                     # the evidence channel's per-robot state (evidence.py):
+                     # stale claims/referrals/homing tracks/last sightings
+                     # are the PREVIOUS robot's evidence -- a fresh robot
+                     # could inherit a referral that was never its own, and
+                     # homing tracks would carry a dead robot's odometry
+                     # frame.
+                     "claim_store", "referral_store", "homing_state",
+                     "last_sighting"):
+            d = getattr(worker, attr, None)
+            if isinstance(d, dict):
+                d.pop(k, None)
         if hasattr(worker, "simple_hilbert_order"):
             worker.simple_hilbert_order.pop(k, None)
         # The coordinator keeps this
@@ -362,6 +439,18 @@ class Trainer:
         self._roll_split_heartbeat_events = 0
         self._roll_seed_find_bonus_sum = 0.0
         self._roll_wall_find_penalty_sum = 0.0
+        self._roll_target_shaping_sum = 0.0
+        self._roll_target_shaping_count = 0
+        self._roll_global_shaping_sum = 0.0
+        self._roll_global_shaping_count = 0
+        self._roll_belief_shaping_sum = 0.0
+        self._roll_belief_err_sum = 0.0
+        self._roll_belief_err_count = 0
+        self._roll_overclaim_sum = 0.0
+        self._roll_stop_bonus_count = 0
+        self._roll_stop_bonus_missed = 0
+        self._roll_acc_income_sum = 0.0
+        self._roll_time_cost_sum = 0.0
         self._roll_belief_conf_bonus_sum = 0.0
         self._roll_shaping_sum = 0.0
         self._roll_conf_pos_sum = 0.0
@@ -415,7 +504,15 @@ class Trainer:
             node = snap["node"]
             m = node.shape[0]
             edge_index = snap["edge_index"]
-            reward = compute_rewards(node, self.cfg, edge_index)
+            # reward_mode "target" (docs/tuning.md phase 165): the any-pixel
+            # shape income (r_on/off_penalty/pack) is dropped -- it rewards
+            # occupying SOMEONE's pixel, and the objective is the robot's OWN.
+            # The separation term alone survives (anti-clumping along the
+            # stroke); the accuracy income below replaces the rest.
+            if self.cfg.reward_mode == "target":
+                reward = separation_reward(node, self.cfg)
+            else:
+                reward = compute_rewards(node, self.cfg, edge_index)
             # While the ORACLE is driving, success/reset and
             # the cov_sum/cov_count-derived reporting come from the oracle's
             # own "arrived" state label -- worker.simple_state, the same
@@ -450,6 +547,45 @@ class Trainer:
                 cov = arrived_count / m if m > 0 else 0.0
             else:
                 cov = float(coverage(node, self.cfg))
+            # Computed here so it can serve as both a reward input (below) and,
+            # when cfg.success_metric == "settled", the success/reset value in
+            # place of coverage -- the same cov-variable-repurpose pattern
+            # phase 153 used for the oracle's arrived fraction. NaN targets
+            # are excluded from the mean and from the reward entirely.
+            dists = None
+            valid_t = None
+            dv = None
+            errs = None
+            if (self.cfg.reward_mode == "target"
+                    or getattr(self.cfg, "target_shaping", 0.0) > 0.0
+                    or getattr(self.cfg, "global_shaping", 0.0) > 0.0
+                    or getattr(self.cfg, "stop_bonus", 0.0) > 0.0):
+                dists = assigned_target_dists(worker, k, node, self.cfg)
+                valid_t = ~torch.isnan(dists)
+                dv = torch.where(valid_t, dists, torch.zeros_like(dists))
+                if self.cfg.success_metric == "settled" and m > 0:
+                    settled = bool(valid_t.any())
+                    cov = (float(((dv < self.cfg.stop_radius) & valid_t).float().mean())
+                           if settled else 0.0)
+            if (getattr(self.cfg, "belief_shaping", 0.0) > 0.0
+                    or getattr(self.cfg, "global_shaping", 0.0) > 0.0
+                    or getattr(self.cfg, "beacon_honesty", 0.0) > 0.0):
+                # Belief error is independent of target resolution, so it is
+                # computed under its own gate (a run with belief shaping but
+                # no formation pool still pays for correct localization).
+                errs = belief_errors(worker, k, node)
+            hconf = None
+            if getattr(self.cfg, "beacon_honesty", 0.0) > 0.0:
+                # The honesty constraint on the learned beacon: the claimed
+                # conf is read from the transmission node column, the honest
+                # one from the sender's own particles. Penalized per tick in
+                # the reward -- the one channel whose gradient does not
+                # vanish at tanh saturation (reward.beacon_overclaim_penalty).
+                hconf = honest_confidences(worker, k, node)
+                pen = beacon_overclaim_penalty(node, hconf,
+                                               self.cfg.beacon_honesty, self.cfg.dt_fixed)
+                reward = reward + pen
+                self._roll_overclaim_sum = self._roll_overclaim_sum + float(pen.sum())
 
             # Potential-based shaping (optional): F = k * (prev_dist - gamma*dist), with
             # potential -dist. Rewards reducing distance to the stroke every step, giving
@@ -531,6 +667,179 @@ class Trainer:
                 reward = reward + find_reward
                 self._roll_seed_find_bonus_sum = self._roll_seed_find_bonus_sum + float(find_reward.clamp(min = 0.0).sum())
                 self._roll_wall_find_penalty_sum = self._roll_wall_find_penalty_sum + float((-find_reward.clamp(max = 0.0)).sum())
+
+            # ── RL fine-tune reward (docs/tuning.md phases 164-165) ───────────
+            # Built around each robot's OWN assigned pixel: accuracy income
+            # (smooth kernel, pays for being there -- tightest arrivals most),
+            # potential-based shaping (the long-horizon approach gradient),
+            # the shared smooth arena potential (sender credit for learned
+            # messaging), a graded stop bonus on the frozen gate's latch, and
+            # an explicit per-step time cost (speed). dists/valid_t/dv were
+            # computed above for the settled success metric.
+            if dists is not None:
+                # Accuracy income -- replaces the any-pixel r_on income when
+                # reward_mode == "target"; additive scaffolding otherwise.
+                w_acc = getattr(self.cfg, "target_acc_weight", 0.0)
+                sigma_acc = getattr(self.cfg, "target_acc_sigma", 0.05)
+                if self.cfg.reward_mode == "target" and w_acc > 0.0:
+                    inc = accuracy_income(dists, valid_t, w_acc, sigma_acc, self.cfg.dt_fixed)
+                    reward = reward + inc
+                    self._roll_acc_income_sum = self._roll_acc_income_sum + float(inc.sum())
+                # Speed: a carrying cost per step, charged ONLY while the
+                # robot is not yet settled at its own pixel (true distance
+                # past stop_radius). Two properties this term needs to
+                # actually work, both easy to get wrong:
+                #   * It must be conditional. An unconditional per-step
+                #     constant is a policy-gradient no-op: every trajectory
+                #     of equal length pays the identical total, the value
+                #     baseline absorbs it exactly, and no advantage changes.
+                #     Charged only while unsettled, settling at tick 100 vs
+                #     tick 1000 differs by 900 charged ticks, which IS a
+                #     gradient -- and gamma discounting makes it prefer
+                #     earlier still.
+                #   * The relief bar must be TRUE distance, not the latch
+                #     flag. A robot the gate falsely latched far from its
+                #     target keeps paying -- wrong parking buys no cost
+                #     relief, so the term cannot be mined by racing the
+                #     filter into a premature latch.
+                w_time = getattr(self.cfg, "target_time_cost", 0.0)
+                if w_time > 0.0:
+                    unsettled = valid_t & (dv >= self.cfg.stop_radius)
+                    cost = torch.where(unsettled, torch.full_like(dv, w_time * self.cfg.dt_fixed),
+                                       torch.zeros_like(dv))
+                    reward = reward - cost
+                    self._roll_time_cost_sum = self._roll_time_cost_sum + float(cost.sum())
+
+                # Potential-based shaping on the robot's own assigned-target
+                # distance. Same form as the existing reward_shaping, but in
+                # normalized units against the per-robot target rather than
+                # the arena's nearest-on-pixel; not annealed (policy-invariant
+                # by construction). No shaping on the first step after a
+                # reset, matching reward_shaping above.
+                if getattr(self.cfg, "target_shaping", 0.0) > 0.0:
+                    if not hasattr(worker, "prev_target_dist"):
+                        worker.prev_target_dist = {}
+                    prev = worker.prev_target_dist.get(k)
+                    if prev is not None and prev.shape == dists.shape:
+                        shaping = self.cfg.target_shaping * (prev - self.cfg.gamma * dv)
+                        shaping = torch.where(valid_t, shaping, torch.zeros_like(shaping))
+                        reward = reward + shaping
+                        self._roll_target_shaping_sum = self._roll_target_shaping_sum + float(shaping.sum())
+                        self._roll_target_shaping_count = self._roll_target_shaping_count + int(valid_t.sum())
+                    worker.prev_target_dist[k] = dists.detach().clone()
+
+                # Graded stop bonus, paid the tick after the arrival gate
+                # latches (pending_stop_bonus set in act(), actor-driving
+                # modes only): bonus * exp(-(d/stop_radius)^2). Full bonus
+                # only for a tight arrival; a gate false positive far from
+                # the pixel earns ~nothing (exp(-64)), so the bonus cannot
+                # reward parking in the wrong place, and the smooth kernel
+                # keeps a gradient between the tolerance bands instead of a
+                # cliff. Paid ONCE per robot per episode: with
+                # arrived_release_threshold > 0 a latched robot can release
+                # and re-latch, and an arrived logit oscillating across the
+                # hysteresis band would otherwise collect the bonus every
+                # cycle -- benign for the settle metric (the robot IS at its
+                # pixel) but a standing incentive for confidence
+                # oscillation (docs/tuning.md phase 166).
+                if getattr(self.cfg, "stop_bonus", 0.0) > 0.0:
+                    if not hasattr(worker, "stop_bonus_paid"):
+                        worker.stop_bonus_paid = {}
+                    paid = worker.stop_bonus_paid.setdefault(k, {})
+                    pending = worker.pending_stop_bonus.get(k, {})
+                    for l, _flag in list(pending.items()):
+                        if l < m and bool(valid_t[l]) and l not in paid:
+                            b = self.cfg.stop_bonus * float(target_kernel(dv[l], self.cfg.stop_radius))
+                            if b > 1e-6:
+                                reward[l] = reward[l] + b
+                                paid[l] = True
+                                self._roll_stop_bonus_count = self._roll_stop_bonus_count + 1
+                            else:
+                                self._roll_stop_bonus_missed = self._roll_stop_bonus_missed + 1
+                        else:
+                            self._roll_stop_bonus_missed = self._roll_stop_bonus_missed + 1
+                    if pending:
+                        pending.clear()
+
+            # ── belief-error terms (docs/tuning.md, the transmission phase) ──
+            # Deliberately OUTSIDE the `dists is not None` block: these pay
+            # for correct localization, which is defined whether or not the
+            # arena resolved anyone's assigned pixel, and errs was computed
+            # under its own gate above for exactly that reason.
+            if errs is not None:
+                finite = ~torch.isnan(errs)
+                # Per-robot potential-based shaping on the robot's OWN belief
+                # error (reward.belief_errors): F = k*(prev_e - gamma*e),
+                # positive exactly when the filter's estimate moves toward
+                # the truth. Correctness-grounded, not confidence-grounded
+                # (see config.belief_shaping) -- a confidently wrong cloud
+                # keeps e large and earns nothing. Dense across the
+                # localization phase where the own-target kernels are flat.
+                # NaN (no belief yet) means no gradient for that robot,
+                # never zero -- same convention as the target shaping.
+                if getattr(self.cfg, "belief_shaping", 0.0) > 0.0:
+                    if not hasattr(worker, "prev_belief_err"):
+                        worker.prev_belief_err = {}
+                    # The mask must cover BOTH sides: a robot's belief entry
+                    # appears at its first decision, so prev_e can be NaN on
+                    # a row where the current errs is finite (measured: 7/46
+                    # robots NaN'd the reward at the tick their belief first
+                    # existed -- the mask from errs alone let prev_e's NaN
+                    # through the where()). Robots gaining a belief pay no
+                    # shaping on that tick, matching the reset convention.
+                    valid_e = ~torch.isnan(errs)
+                    prev_e = worker.prev_belief_err.get(k)
+                    if prev_e is not None and prev_e.shape == errs.shape:
+                        both = valid_e & ~torch.isnan(prev_e)
+                        ev = torch.where(both, errs, torch.zeros_like(errs))
+                        pv = torch.where(both, prev_e, torch.zeros_like(prev_e))
+                        b_shaping = self.cfg.belief_shaping * (pv - self.cfg.gamma * ev)
+                        b_shaping = torch.where(both, b_shaping, torch.zeros_like(b_shaping))
+                        reward = reward + b_shaping
+                        self._roll_belief_shaping_sum = self._roll_belief_shaping_sum + float(b_shaping.sum())
+                    worker.prev_belief_err[k] = errs.detach().clone()
+                self._roll_belief_err_sum = self._roll_belief_err_sum + float(errs[finite].sum())
+                self._roll_belief_err_count = self._roll_belief_err_count + int(finite.sum())
+
+            # Shared arena-level potential (sender credit): a SMOOTH mean
+            # kernel over every robot's own-target distance, added equally
+            # to all. Potential-based, so the optimal policy is unchanged;
+            # a sender's return now improves whenever the swarm gets
+            # closer, anywhere in the approach -- the gradient that makes
+            # broadcasting learnable under per-robot GAE. A threshold
+            # potential was rejected for exactly this: it is flat almost
+            # everywhere and only credits the tick a neighbour crosses.
+            # Two bands (reward.arena_potential): the settled kernel
+            # above, plus a belief-error kernel that moves during the
+            # localization phase -- where a helpful broadcast actually
+            # does its work and where the settled kernel alone is flat
+            # (phase 163's curve: settled<5u is 0.016 at tick 2000; the
+            # localization phase is the whole first half of an episode).
+            if getattr(self.cfg, "global_shaping", 0.0) > 0.0:
+                if not hasattr(worker, "prev_global_pot"):
+                    worker.prev_global_pot = {}
+                pot = arena_potential(dists, valid_t, errs, None, self.cfg)
+                prev_pot = worker.prev_global_pot.get(k)
+                if prev_pot is not None:
+                    # SIGN: pot is a higher-is-better kernel, so the PBRS form
+                    # of the (t-1 -> t) transition is F = k*(gamma*pot_t -
+                    # pot_{t-1}) -- positive when the arena IMPROVES. The
+                    # phase-164/165 code computed k*(prev_pot - gamma*pot),
+                    # the exact negative, paying the swarm for the potential
+                    # FALLING and penalizing every improvement -- an inverted
+                    # sender credit (a helpful broadcast that raised the
+                    # potential penalized its own sender). Caught by
+                    # test_global_shaping_belief_band_credits_without_target_
+                    # resolution; the distance-shaped terms (reward_shaping,
+                    # target_shaping, belief_shaping) were never affected --
+                    # for a lower-is-better quantity, (prev - gamma*curr) IS
+                    # the correct form, which is how the inversion went
+                    # unnoticed for two phases.
+                    g = self.cfg.global_shaping * (self.cfg.gamma * pot - prev_pot)
+                    reward = reward + g
+                    self._roll_global_shaping_sum = self._roll_global_shaping_sum + g * m
+                self._roll_global_shaping_count = self._roll_global_shaping_count + m
+                worker.prev_global_pot[k] = pot
 
             self._roll_reward_sum = self._roll_reward_sum + float(reward.sum())
             self._roll_reward_count = self._roll_reward_count + m
@@ -628,6 +937,18 @@ class Trainer:
                 "split_heartbeat_events": self._roll_split_heartbeat_events,
                 "seed_find_bonus_sum": self._roll_seed_find_bonus_sum,
                 "wall_find_penalty_sum": self._roll_wall_find_penalty_sum,
+                "target_shaping_sum": self._roll_target_shaping_sum,
+                "target_shaping_count": self._roll_target_shaping_count,
+                "global_shaping_sum": self._roll_global_shaping_sum,
+                "global_shaping_count": self._roll_global_shaping_count,
+                "belief_shaping_sum": self._roll_belief_shaping_sum,
+                "belief_err_sum": self._roll_belief_err_sum,
+                "belief_err_count": self._roll_belief_err_count,
+                "overclaim_sum": self._roll_overclaim_sum,
+                "stop_bonus_count": self._roll_stop_bonus_count,
+                "stop_bonus_missed": self._roll_stop_bonus_missed,
+                "acc_income_sum": self._roll_acc_income_sum,
+                "time_cost_sum": self._roll_time_cost_sum,
                 "belief_conf_bonus_sum": self._roll_belief_conf_bonus_sum,
                 "shaping_sum": self._roll_shaping_sum,
                 "conf_pos_sum": self._roll_conf_pos_sum,
@@ -685,7 +1006,7 @@ class Trainer:
                 stats = self._merge_stats(ppo_logs, dt)
                 stats["time/collect_sec"] = t_collect
                 stats["time/ppo_sec"] = t_ppo
-                logger.log_scalars(stats, step)
+                logger.log_scalars(tb_view(stats, self.cfg), step)
                 logger.log_histograms(self._histograms(buffer, policy), step)
                 logger.console(it, step, stats)
                 if summary is not None:
@@ -694,7 +1015,8 @@ class Trainer:
                       % (t_collect, self._t_step, self._t_parse, self._t_getsteps, self._t_snap, self._t_act, t_ppo))
 
                 if it == start_iter:
-                    check_startup_coverage(stats, min_start_cov)
+                    check_startup_coverage(stats, min_start_cov,
+                                           getattr(self.cfg, "success_metric", "coverage"))
 
                 if ckpt_path is not None and ckpt_every > 0 and (it + 1) % ckpt_every == 0:
                     save_checkpoint(ckpt_path, it + 1, policy, critic, actor_opt, critic_opt)

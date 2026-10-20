@@ -46,6 +46,141 @@ class Config:
     r_pack: float = 1.0
     pack_range: float = 0.20
 
+    # ─── RL fine-tune reward (docs/tuning.md phases 164-165) ─────────────────
+    # Per-robot distance to its OWN assigned target point
+    # (observation.ensure_target, python-side geometry -- NOT Unity's baked
+    # distance field, which is 90-degree-rotated at the player's default
+    # KILOBOT_BAKE_ROTATION_STEPS=1). F = k * (prev_d - gamma * d) per
+    # robot, in normalized units. Theory-safe (policy-invariant), so unlike
+    # reward_shaping this is not annealed. Robots without a resolved target
+    # get zero.
+    target_shaping: float = 0.0
+    # One-time bonus paid the tick after the arrival gate latches a robot
+    # (actor_io._arrived_head_gate's False->True transition, actor-driving
+    # modes only), GRADED by the true distance to the robot's own assigned
+    # target: bonus * exp(-(d/stop_radius)^2). Full bonus only for a tight
+    # arrival; a gate false positive far from the pixel earns ~nothing. The
+    # gate itself stays frozen during RL (phase 161's hybrid already beats
+    # the oracle's stopping, and an absorbing wrong stop is the measured
+    # failure mode).
+    stop_bonus: float = 0.0
+    # Kernel width of the graded stop bonus, in normalized units (0.05 =
+    # 5 raw units, the settle metric's primary bar).
+    stop_radius: float = 0.05
+    # Shared arena-level potential for sender credit: F = k * (prev_pot -
+    # gamma * pot), added EQUALLY to every robot in the arena. This is what
+    # makes broadcasting learnable under per-robot GAE (buffer.py groups
+    # trajectories per robot): a message that helps a neighbour settle
+    # raises the shared potential, and every sender's own return carries
+    # that improvement. Without it the sender of a helpful message gets no
+    # gradient at all, since GAE never routes one robot's reward into
+    # another robot's advantage.
+    global_shaping: float = 0.0
+    # Width of the SMOOTH kernel behind that shared potential:
+    # pot = mean_i exp(-(d_i/sigma)^2) over robots with resolvable targets.
+    # A threshold (fraction within a radius) is flat almost everywhere and
+    # would only credit a sender at the exact tick a neighbour crosses the
+    # bar; the kernel has gradient at every distance, including mid-
+    # approach -- which is where a helpful message actually does its work.
+    global_potential_sigma: float = 0.10
+    # reward_mode "target": replaces the any-pixel shape income entirely.
+    # Per-robot accuracy income w_acc * exp(-(d_i/sigma_acc)^2) * dt -- pays
+    # for BEING at the robot's own assigned pixel, tightest arrivals most;
+    # localization is rewarded instrumentally (a robot that has not
+    # figured out where it is cannot find the pixel). Speed is rewarded
+    # twice over: the gamma discount makes earlier income worth more, and
+    # target_time_cost subtracts w_time * dt per step from every robot with
+    # a resolvable target, so lingering anywhere has a carrying cost. The
+    # separation term (anti-clumping) is kept; r_on/off_penalty/pack --
+    # which reward occupying ANY pixel, the exact failure phase 159
+    # identified -- are dropped. success_metric "settled" makes the
+    # success/reset condition the settled fraction (same bar as the stop
+    # bonus) instead of coverage.
+    target_acc_weight: float = 1.0
+    target_acc_sigma: float = 0.05
+    target_time_cost: float = 0.0
+    success_metric: str = "coverage"   # "coverage" or "settled"
+    # Per-robot potential-based shaping on the robot's OWN belief error
+    # (|particle-filter mean position - true position|, normalized units --
+    # privileged, like every reward quantity; the actor never sees it).
+    # F = k * (prev_e - gamma * e), positive exactly when the filter's
+    # position estimate moves toward the truth. This is NOT the phase-2/9
+    # belief_conf bonus: conf pays for a collapsed cloud, converged or not,
+    # and was measured to make confidently-wrong profitable; the error pays
+    # only for CORRECT localization, which no wrong convergence can fake.
+    # Dense from the first landmark fix (the phase the whole settle curve
+    # spends its first ~3000 ticks in), where the own-target terms are still
+    # flat -- the accuracy kernel is exp(-(d/0.05)^2), zero until the robot
+    # is nearly AT its pixel, and target shaping's gradient is weak far out.
+    belief_shaping: float = 0.0
+    # Kernel width of the belief-error band inside the shared arena potential
+    # (see global_shaping): sigma deliberately much wider than the accuracy
+    # kernel's 0.05 because the belief error is large until a robot has
+    # genuinely localized (spawn e ~ 0.4-0.7, localized e ~ 0.05), and the
+    # sender credit must move while that error is still being reduced --
+    # which is exactly when a helpful broadcast does its work.
+    belief_potential_sigma: float = 0.20
+    # Relative weight of the belief-error band against the settled band
+    # inside the shared arena potential. pot = mean_i [ kernel(d_i, sigma_g)
+    # + belief_potential_weight * kernel(e_i, belief_potential_sigma) ].
+    belief_potential_weight: float = 1.0
+    # Per-tick penalty on a robot whose BROADCAST conf (message slot 2,
+    # read from the transmission node column) exceeds its own honest filter
+    # confidence (conf_pos * r over its own particles): -w * relu(claimed -
+    # honest) * dt. The honesty constraint on the learned beacon -- see
+    # reward.beacon_overclaim_penalty for the measured failure it exists to
+    # close (PPO pushed the conf gate to 2.4x honest; the receiver fuses the
+    # MOST confident row, so overclaimed beacons with ~50-unit-wrong
+    # positions always win the slot). 0 disables.
+    beacon_honesty: float = 0.0
+    # Zero the split actor's message head after KILOBOT_INIT_ACTOR loads it,
+    # so broadcasts start at exactly zero -- the distribution the BC tapes'
+    # receivers were trained on (oracle-driven tapes broadcast zeros; the
+    # message head is never supervised by BC, so a warm-started head_msg is
+    # random noise that would corrupt the clone's navigation input from
+    # iteration 0). Pair with msg_log_std for quiet exploration.
+    quiet_msg_head: bool = False
+    # Overwrite the loaded per-dimension log-std on the MESSAGE dimensions
+    # only (motor dims keep the checkpoint's). 0.0 keeps the loaded value.
+    # The clamp floor is KILOBOT_LOG_STD_MIN, so a value below it needs that
+    # lowered too (e.g. -4.0). Start quiet (near-zero message noise) and let
+    # the entropy bonus grow exploration over the run.
+    msg_log_std: float = 0.0
+    # Weight of ppo's auxiliary supervision of message slots 0-2 toward the
+    # honest beacon (the robot's own belief mean x, y and conf_pos*r, read
+    # from the same prop columns actor_io's honest-beacon override uses).
+    # This is the cold-start ladder for a learned beacon: the receiver-side
+    # fusion gate (PEER_CONF_MIN=0.85) needs the squashed conf past 0.85,
+    # i.e. a pre-tanh mean above ~1.73 -- unreachable from a quiet start by
+    # entropy exploration alone, so the useful-protocol basin has no gradient
+    # path from the silent one without a supervised prior. A prior, not a
+    # cage (the oracle_residual pattern): where the RL advantage consistently
+    # disagrees, the mean can move away from the honest beacon. 0 disables.
+    msg_supervision: float = 0.0
+    # The message head reads cat([g, prop]) instead of g alone (see
+    # kilobot_gnn.SplitObservationActor's own comment for the measurement
+    # behind this). The beacon is then a linear readout of the robot's own
+    # filter state -- the honest protocol as the head's INITIALIZATION
+    # (launch.apply_warm_start_message_policy's beacon readout), refined by
+    # msg_supervision and free to be modulated by the RL gradient. Without
+    # it, the head must pull absolute position through the motor-trained
+    # GRU trunk, which measured at a 0.5-normalized-error plateau head-only
+    # and wrecked the warm start when trained through (kl 7/iteration).
+    msg_head_prop_input: bool = False
+    # Same override for the MOTOR dimensions. Load-bearing for the RL
+    # fine-tune: a bc_offline checkpoint's saved log_std is a placeholder
+    # (Config.log_std_init = -0.5, std 0.61) that BC never trains -- the MSE
+    # fit only shapes the MEAN. Deterministic eval (squash of the mean) never
+    # touches it, so the clone scores 0.63 settled<5u on the closed-loop
+    # harness, but the very first STOCHASTIC rollout executes 0.5*(tanh(N(
+    # mean, 0.61))+1) per wheel -- effectively random wheel speeds -- and the
+    # warm start is dead at iteration 0, before any PPO update runs (measured:
+    # settled 0.002 from iter 0, conf_pos 0.004, std_m/i 0.05/0.61 in
+    # results/rl_v1_console.log). Setting this (e.g. -2.5 -> std 0.082) starts
+    # motor exploration quiet instead; the entropy bonus can reopen it if the
+    # value of exploring outweighs the income a precise command earns.
+    motor_log_std: float = 0.0
+
     # ─── actor ───────────────────────────────────────────────────────────────
     actor_type: str = "deepset"   # "deepset", "gru", or "gru_split_observation"
     gru_hidden: int = 128
@@ -70,7 +205,7 @@ class Config:
     prop_scale: float = 20.0
     prop_time_scale: float = 20.0
     prop_cum_scale: float = 0.02
-    reward_mode: str = "normal"   # "normal", "speed", "steer", or "steer_blend"
+    reward_mode: str = "normal"   # "normal", "speed", "steer", "steer_blend", or "target"
     speed_weight: float = 0.0     # weight for the pure-speed isolation reward
     steer_weight: float = 0.0     # weight for the steering reward (displacement toward target)
 
@@ -118,12 +253,232 @@ class Config:
     # tried still double-counts correlated information, so seed-only filtering
     # is the supported mode.
     belief_comms: bool = False
+    # With belief_comms on, skip actor_io's honest-beacon override of message
+    # slots 0-2 (which force-writes the sender's own filter mean position and
+    # conf there) and let the POLICY's message head learn the beacon content.
+    # The receiver side is unchanged: belief_update.add_peer_range fuses
+    # whatever (x, y, conf) the broadcast carries, range from signal strength,
+    # gated at PEER_CONF_MIN with sigma inflated by the claimed conf. A
+    # squashed conf below ~0.85 makes the filter ignore the row, so the
+    # learned policy holds an explicit on/off gate: broadcast a true position
+    # with conf past the bar and every receiver in IR range gains a real
+    # range-bearing fix; broadcast garbage with high conf and receivers'
+    # belief errors GROW (the arena potential drops, the sender's own return
+    # with it). With the quiet message start the head outputs zero ->
+    # conf 0 -> nothing is fused, so a warm-started run begins exactly at
+    # the no-messaging behaviour and grows the protocol from there.
+    belief_comms_learned: bool = False
     # Floats 3-5 carry a committed robot's claimed navigation target (x, y,
     # valid) -- not its position, and not belief_comms's slots, so the two never
     # collide. On by default: it is the non-privileged replacement for occupancy
     # checks that used to read every robot's true position directly, and
     # collision avoidance during target selection is core behaviour.
     oracle_claim_broadcast: bool = True
+    # Zero the drawn neighbour row's message content (slots 0-8) in Tc when the
+    # row came from a PEER robot (senderId >= 1), keeping only the received
+    # signal strength. Wall-seed rows (negative senderId, real landmark
+    # positions) are untouched. With this on, a live beacon reaches a receiver
+    # only through its belief filter (add_peer_range) and never through the
+    # motor trunk's Tc input -- the BC tapes' peer rows carried zeros in slots
+    # 0-2, so any beacon content is a measured input-distribution shift the
+    # clone pays for (docs/tuning.md phase 168, driver D); this routes the
+    # channel around that shift entirely. The policy's own broadcasts are
+    # unaffected: Tc is the RECEIVER's observation, not the sender's action.
+    tc_peer_zero: bool = False
+    # The honest-beacon override writes slots 0-2 only when the robot's own
+    # arrival latch has fired (or fires this tick); moving robots stay silent.
+    # Settled robots make accurate (~settle-radius) landmark beacons that do
+    # not drift, and their beacons appear exactly as settling progresses --
+    # the wavefront protocol -- instead of semi-localized gossip whose claims
+    # measure ~0.11 normalized off (the measured dominant ring-bias source).
+    # Pairs with peer_innovation_min on the receiver side.
+    beacon_arrived_only: bool = False
+    # Stage 2b sender gate: with belief_comms on, a robot broadcasts the
+    # honest beacon when it is anchored this episode (one direct seed/wall
+    # sighting) AND its own belief confidence is at or above this bar --
+    # instead of only after the arrival latch fired. Measured reason (S2a):
+    # the arrived-only sender pool is geometrically separated from the
+    # receivers that need it -- senders cluster at the shape, receivers in
+    # need are mid-arena, and 7u IR cannot bridge it; widening the receiver
+    # gate (0.85 -> 0.70/0.60) moved nothing. Anchored mid-arena robots put
+    # senders out where the receivers are. Content stays the honest readout;
+    # receiver sigma derives from sender confidence. Takes precedence over
+    # beacon_arrived_only when > 0; 0 keeps the historical behaviour.
+    beacon_anchored_min_conf: float = 0.0
+    # The robust hop-count protocol (the measured honest-beacon space is
+    # exhausted: position claims need accurate means, and the only senders
+    # with good means are geometrically unreachable by receivers in need --
+    # S2a/S2b). A robot maintains its communication-graph distance in IR hops
+    # to each corner seed (min-relaxation flood over received message slots,
+    # observation.hop_flood_update; direct seed sighting = hop 0) and
+    # broadcasts it in message slots 0-3. Receivers fuse the hop counts as
+    # SOFT UPPER BOUNDS: euclidean dist(p, seed_s) <= k * IR range, so the
+    # intersection of several seeds' bounds prunes the particle cloud without
+    # any sender-mean error entering it (integer minima self-correct; a
+    # stale larger k is still a valid bound). This is the information
+    # mid-arena robots lack. Flooding is engaged, not learned -- a stopped
+    # robot keeps relaying. Default off.
+    hop_comms: bool = False
+    # The learned RECEIVER (the last untried branch of the transmission
+    # investigation). The policy's own message slot 3 -- free real estate:
+    # the honest beacon writes slots 0-2 and the supervision prior targets
+    # slots 0-2 only -- is the robot's receiver-trust output: post-squash
+    # [-1,1] maps to g = 0.5*(v+1) in [0,1], stored per-robot between
+    # decisions, and next tick scales THAT robot's fused-ring sigma by 1/g
+    # (belief.add_peer_range). g=1 reproduces the ungated receiver exactly;
+    # g -> 0 defuses rings smoothly instead of binary-gating them. PPO
+    # prices the gate through the correctness-grounded reward (a fusion
+    # that worsens the robot's own belief error costs advantage on the
+    # gate). The readout init plants the gate at ~0.98 (status-quo
+    # receiver) via head_msg's slot-3 bias, so training starts at today's
+    # behavior and learns whether to close it. Default off.
+    recv_gate: bool = False
+    # Innovation gate for add_peer_range: a peer ring is fused only if at
+    # least this fraction of the receiver's particles lie within 2*sigma of
+    # the ring. A ring inconsistent with the whole cloud is either a liar's
+    # claim or a rescue case; fusing it anyway drags the mean every decision
+    # tick (the measured false-arrival mechanism). 0 disables. Values around
+    # 0.05 separate cleanly: a spread cloud covers any ring band densely,
+    # a confidently-wrong collapsed cloud covers it ~never.
+    peer_innovation_min: float = 0.0
+    # The receiver's usability gate for a peer beacon (belief.PEER_CONF_MIN).
+    # Measured: the honest beacon's confidence has median 0.80 for settled
+    # robots, so the historical 0.85 filtered out most of the honest sender
+    # pool (96% of receiver updates saw zero usable peers -- a threshold
+    # mismatch, not sender scarcity). Default keeps 0.85 for compatibility.
+    peer_conf_min: float = 0.85
+    # The arrival latch (closed-form and learned head alike, hybrid included)
+    # requires the robot to have had at least one DIRECT seed/wall sighting
+    # this episode. A robot that has never seen the map geometry has no
+    # absolute anchor except chained peer claims, and letting pure hearsay
+    # stop a robot terminally is the hop-by-hop error-propagation path. The
+    # flag the filter itself tracks is decision-tick sightings, which is also
+    # what the filter ever sees, so reward and gate cannot disagree.
+    arrival_min_anchored: bool = False
+    # The arrival condition must hold on this many CONSECUTIVE decisions
+    # before the latch fires; 1 keeps the current behaviour. Inflated
+    # confidence from a freshly fused ring is exactly a transient -- a robot
+    # whose belief genuinely sits on its pixel keeps satisfying the
+    # condition, one whose conf was just pumped through it does not.
+    arrival_persist: int = 1
+    # Gate-1 encounter probe (eval instrumentation only, off everywhere else):
+    # per decision tick, record whether this robot heard any peer at all and
+    # whether any peer row carried beacon content at or above each confidence
+    # bar -- i.e. whether an EVIDENCE HOLDER was in IR range. Counters live
+    # per robot on the worker and are split into lost-phase (own conf < 0.4)
+    # vs localized-phase, which is the window-matching question the
+    # evidence-sharing design stands or falls on. Reads only data already in
+    # the row pool; fuses nothing; writes nothing to the wire.
+    encounter_probe: bool = False
+    # ---- The evidence-sharing channel (the measured redesign; see
+    # evidence.py's docstring for the full design and docs/tuning.md for the
+    # Gate 1/2 measurements behind every choice). Master switch. Implies the
+    # honest beacon writer under the anchored-conf sender gate and REPLACES
+    # single-ring argmax fusion with the claim store + belief.add_peer_fix
+    # consensus path. Incompatible with hop_comms, recv_gate and
+    # claim_broadcast: those measured out, and their slot usage collides.
+    evidence_comms: bool = False
+    # The beacon/disclosure sender gate's confidence bar. Gate 1 measured the
+    # anchored-0.7 pool at a 57% lost-phase hit rate vs 19% for arrived-only,
+    # with 34% of localized robots hearing evidence BEFORE localizing (vs
+    # 0.7%). The conf distribution is bimodal (~0.8+ parked or post-fix,
+    # ~0.0-0.3 lost), so 0.7 admits the honest sender population.
+    evidence_beacon_conf: float = 0.7
+    # A referral's effective recency decays over this many ticks in the
+    # RECEIVER's clock (from its own reception tick); at zero the referral is
+    # dropped. Should comfortably exceed a mid-arena crossing (~2000 ticks at
+    # full speed) so referrals survive the approach.
+    disclosure_recency_ticks: int = 2000
+    # Claims retained per receiver, keyed by sender (latest wins), oldest
+    # evicted. 8 senders is generous against scatter-density neighbor counts.
+    claim_store_capacity: int = 8
+    # Stored-claim sigma aging: odometry variance accumulates as
+    # rate * path (normalized units) under the belief code's 0.02 variance
+    # convention, so a claim heard 1.0 normalized-units of travel ago carries
+    # conf * exp(-0.004/0.02) ~ 0.82 of its original weight. Guards the
+    # consensus fix against stale-claim bias compounding with drift.
+    claim_odo_var_rate: float = 0.004
+    # The consensus pre-gate (evidence.consensus_filter): a claim is
+    # materialized for the fix only when a DISTINCT sender's claim agrees
+    # with it on the receiver's own cloud -- the fraction of particles within
+    # BOTH rings' 2-sigma bands must reach this. The measured T1a harm
+    # (0.6383/0.6649 vs 0.6915 at fs7) was correlated wrong-latch pairs
+    # passing the separation cap; this is the veto a spread cloud can
+    # actually apply. 0 disables the pre-gate (bare materialization).
+    consensus_agreement_min: float = 0.10
+    # T1b: the scripted homing override (Gate 2's controller at pipeline
+    # scale) replaces the policy's motors for LOST robots (own conf < 0.4)
+    # holding a fresh referral with a trustworthy strength-law fit. Policy
+    # motors are untouched for everyone else. The law's state machine
+    # (evidence.update_homing): declining gradient -> one perpendicular
+    # reorientation (20-tick refractory); out of contact past
+    # homing_grace_ticks -> sweep back through the disc; out past
+    # homing_budget_ticks -> ABANDON the referral and return the robot to
+    # its own policy. The measured T1b catastrophe (settled 0.1815 at fs7)
+    # was the naive port WITHOUT this state machine: a stale fit captured
+    # robots indefinitely and wall-following -- their only localization
+    # path -- never happened.
+    referral_homing: bool = False
+    homing_grace_ticks: int = 120
+    homing_budget_ticks: int = 400
+    # T2: append the +3 homing proprioception (distance, sin, cos to the
+    # fitted referral beacon) to the split actor's proprioception. CHANGES THE
+    # ACTOR'S INPUT WIDTH: BC tapes for a homing_proprio warm start must be
+    # recorded with these columns dark (zeros), and the warm-start loader
+    # must tolerate the first-layer width change.
+    homing_proprio: bool = False
+    # T2: the policy's message slot 6 becomes a broadcast veto -- post-squash
+    # sample < 0 silences the robot's whole row. Content stays env-written;
+    # the policy can only make the swarm quieter, never lie louder. Off in
+    # T1 (the writer zeroes 6-8 explicitly; the wire carries protocol content
+    # only).
+    learned_veto: bool = False
+    # The veto's initial pre-squash bias (launch.warm_start_message_policy
+    # applies it; the resume paths re-apply it so an exploration run can
+    # start a trained veto from a new bias). Default +2.0 = the T1 writer
+    # (P(veto) ~ 4e-4 at the msg std); the t2ax exploration run used +0.5.
+    veto_init: float = 2.0
+    # T2b (docs/t2b_design.md): the policy's message slot 7 carries a graded
+    # self-trust annotation for its OWN claim. Receiver-side, one-sided:
+    # multiplier = 1 + min(0, t) -- non-negative samples are exact no-ops
+    # (no amplification, and a legacy writer's zeroed slot reads as full
+    # trust), t=-1 drops the claim at materialization. Slots 0-6 unchanged:
+    # the honest beacon and the disclosure stay env-written, the veto stays
+    # the row-level kill. Requires evidence_comms.
+    learned_self_trust: bool = False
+    # Phase 170: replace single-ring peer fusion with the multi-beacon
+    # position fix. belief.add_peer_fix solves a Gauss-Newton least-squares
+    # fix over the usable beacons' rings (initialised at the cloud's own
+    # mean), vets >= 3-beacon sets by their own over-determination residual,
+    # bounds the exactly-2-beacon case by claimed-position separation, and
+    # delivers the fix as a HYPOTHESIS -- injected at bounded mass into the
+    # worst-weight half of clouds whose spread is past peer_inject_min_spread,
+    # never reweighted into log_w. The hypothesis then has to earn weight
+    # against the receiver's own evidence; on a tick with no direct
+    # measurement, floor_peer_only_spread keeps spread above 0.1, so conf
+    # cannot reach the arrival gate's 0.4 bar on peer claims alone. Measured
+    # motivation (docs/tuning.md phase 169): single-ring fusion costs a flat
+    # ~-0.10 settled regardless of gating, because a spread cloud cannot vet
+    # one ring and the fused cloud collapses onto an arbitrary point of it.
+    peer_fix: bool = False
+    # Beacons in the fix (top-K usable rows by signal strength -- the nearest
+    # senders, whose ranges are the most accurate).
+    peer_fix_topk: int = 6
+    # Weighted-RMS LSQ residual, in sigma units, above which a >= 3-beacon
+    # fix is refused: the over-determination consistency test. Two-beacon
+    # fixes are vacuously self-consistent and are instead bounded by
+    # PEER_PAIR_MAX_SEP. 0 disables the gate.
+    peer_fix_resid_max: float = 1.5
+    # Only receivers whose cloud spread is at least this receive fix
+    # hypotheses: a structured cloud's own seed/wall evidence is better than
+    # a neighbour's claim, and phase 169 measured that telling good receivers
+    # things they already know more accurately is the harm.
+    peer_inject_min_spread: float = 0.2
+    # A robot receives at most one fresh fix hypothesis per this many ticks
+    # (the oracle_arrived_claim_injection cooldown pattern; without it the
+    # injection churned cold clouds on nearly every decision, measured at
+    # 71% of belief_update calls and real arrivals 4/24 -> 1/24).
+    peer_inject_cooldown_ticks: int = 400
 
     # ─── reward shaping for gru_split_observation ────────────────────────────
     # Per-step bonus of belief_conf_bonus * conf_pos, paid for holding a
@@ -372,6 +727,25 @@ class Config:
     # done. This is the anti-oracle of closed_form_hybrid -- it stops nobody
     # the two disagree about, trading stopping rate for stopping confidence.
     closed_form_and_gate: bool = False
+    # Remove the closed-form latch's terminality (default off = the
+    # historical terminal behaviour, bit-for-bit). Release v3 wakes a latched
+    # robot only on STRONG REPUDIATION: its own belief confidence below
+    # release_repudiate_conf AND believed target distance beyond
+    # release_repudiate_dist; otherwise it stays parked whatever the head
+    # says. Measured reasons this rule and not others (docs/tuning.md):
+    # 59% of wrong-stopped robots no longer satisfied the gate at final
+    # (S1b: conf median 0.20 vs 0.80 for settled-right) -- parked on a latch
+    # their own belief would refuse; but plain closed-form re-testing
+    # churned 55,890 releases/episode and disturbed 29 settled robots per 12
+    # wrong stops fixed (moving 0.043 -> 0.262: a released robot's conf
+    # cannot re-reach the parked latch floor, a poverty trap); and the
+    # learned head saturates at p=1.000 when parked (786/786 debug lines),
+    # so it can never vote to release. The strong-repudiation bar targets
+    # the S1b diagnostic's 16-35u believed-dist population and structurally
+    # cannot touch the borderline-conf settled robots.
+    closed_form_release: bool = False
+    release_repudiate_conf: float = 0.15
+    release_repudiate_dist: float = 0.12
     # Whether a switched-off robot's GRU hidden state stops advancing. True is
     # the original behaviour (phase 142): with nothing having trained the
     # network on the long arrived stretches, letting the recurrence run over

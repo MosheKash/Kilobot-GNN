@@ -10973,3 +10973,1500 @@ while `eval_closed_loop` (which builds the pool for its settled metric) measured
 the correctly-wired one. Fixed: launch.py's eval path now builds the pool for
 the split actor (guarded, prints when it fires); verified end to end headless
 (pool built, checkpoint loads, eval loop runs). The GUI command is unchanged.
+
+## 2026-10-09 (phase 164): RL fine-tune preparation -- the reward, the sender-credit mechanism, and the message-start policy
+
+No training has been run under this yet; this entry documents the design,
+every decision in it grounded in a measured fact from an earlier phase, and
+the two wiring gaps found while implementing it. Goal, user's own words: get
+message passing learned via RL on top of the BC warm start, and beat the
+baseline actor trained off the oracle -- which since phase 163 is
+`results/bc_v2/run_r0` (coverage 0.743, stopped 94.5%, settled<5u 0.516 on
+the 10-arena harness), not the oracle itself.
+
+### What the code says about message learning (verified, not assumed)
+
+- The action is 11 dims: 9 message floats into [-1,1] plus 2 motors into
+  [0,1], one squashed Gaussian with a per-dimension log-std
+  (`policy.py`). `head_msg` is a real head but **BC never supervises it** --
+  the motor loss, arrived head, state head and wall head are the only
+  targets -- so at the warm start it is random weights. PPO's log-prob and
+  entropy do reach it.
+- Every decision broadcasts all 9 floats. A receiver hears **at most one
+  sender per tick**, via the strength-weighted draw over neighbours, corner
+  slots and wall sides (`sample_split_event`); the winner's content and
+  strength land in `Tc[0:9]`/`Tc[9]`. Receiving a message triggers a
+  decision, so talking also raises neighbours' decision rate. A robot does
+  **not** hear its own broadcast (`SwarmManager.cs` skips j==i), so there is
+  no self-loop gradient path through `tc`.
+- Under plain RL (`motor_override="none"`) nothing force-writes the message
+  floats and no RL-path consumer parses claims: the channel is entirely the
+  policy's to learn. Claim broadcast slots 3-7 are only written under
+  `motor_override="oracle"`.
+- The critic already sees each robot's current transmission
+  (`node[:,10:19]`, `SwarmManager.cs`), so the value baseline can model
+  message effects.
+
+### The central design problem, and the chosen answer
+
+GAE is per-robot (`buffer.py` groups by traj_id): a decision's advantage is
+its **own robot's return**. A message that helps a neighbour navigate
+improves the neighbour's reward, not the sender's -- under the handover's
+private reward (distance to own assigned target) the sender of a helpful
+message would get **no gradient at all**, and the message head would drift
+on the entropy term without ever learning content.
+
+Three decisions, made with the project owner:
+
+1. **Message head starts quiet.** The BC tapes' receivers were trained with
+   neighbour messages that were almost all zeros (oracle-driven tapes
+   broadcast zeros; DAgger rounds broadcast the policy's own then-random
+   samples). Left alone, iteration 0 broadcasts noise on all nine floats --
+   shifting the clone's own input distribution and corrupting exactly the
+   navigation the warm start exists to protect. `KILOBOT_QUIET_MSG_HEAD`
+   zeroes `head_msg` after the warm start loads, and `KILOBOT_MSG_LOG_STD`
+   overwrites the message dims' log-std (motor dims keep the checkpoint's);
+   the entropy bonus then grows message exploration over the run.
+2. **Shared global potential for sender credit.**
+   `KILOBOT_GLOBAL_SHAPING` adds `k * (prev_pot - gamma * pot)` to every
+   robot in an arena equally, where `pot` is the fraction of robots within
+   `stop_radius` of their **own assigned targets**. Potential-based, so the
+   optimal policy is unchanged; a sender's return now improves exactly when
+   the swarm's settling improves, which is the gradient that makes
+   broadcasting learnable.
+3. **The stop gate stays frozen.** The hybrid latch (phase 161) already
+   beats the oracle's stopping, it is external to the network (PPO never
+   touches it), and making stopping learnable reintroduces the measured
+   59.5% on-policy false-positive failure (phase 156) -- one wrong stop
+   strands a robot permanently. Messages can improve stopping *indirectly*:
+   better localization raises `conf_pos`, and the closed-form gate fires
+   earlier and more accurately. If settle-rate plateaus below the clone
+   baseline with no messaging gains, making stopping learnable is the first
+   thing to revisit.
+
+### The reward
+
+`KILOBOT_TARGET_SHAPING` (potential-based, per robot, on the normalized
+distance to its OWN assigned target via `observation.ensure_target` --
+python-side geometry, immune to the baked-field rotation) plus
+`KILOBOT_STOP_BONUS` (one-time, the tick after the gate latches, paid only
+when the robot's TRUE distance to its own target is within `stop_radius`, so
+a gate false positive buys nothing). Both from the handover's recommendation;
+neither is annealed (potential-based shaping is policy-invariant, so
+annealing buys nothing here).
+
+### Two wiring gaps found while implementing
+
+- **`launch.py`'s RL path never set `KILOBOT_BAKE_ROTATION_STEPS` for the
+  player.** Only `tools/eval_closed_loop.py` did (defaulting 0). At the
+  player's own default of 1, every coverage/on_bonus/off_penalty/shaping
+  number in an `launch.py`-launched RL run was the 90-degree-rotated
+  geometry of phase 156 -- meaning a coverage-shaped RL run launched the
+  old way would have optimised a different drawing. `make_env` now sets it,
+  defaulting to 0.
+- `_record_snapshots`' reward block had no notion of a per-robot assigned
+  target at all: `assigned_target_dists` (reward.py) resolves each robot's
+  own target through the same `ensure_target` cache the actor's target
+  relative proprioception uses, so reward and observation can never
+  disagree about which point a robot was sent to. NaN (no resolvable
+  target) means no gradient for that robot, never zero.
+
+### Where this leaves the goal
+
+Everything is wired and unit-tested (8 new tests in
+`tests/test_target_reward.py`; suite 277 passed against a real player). The
+run, from `python/`, warm-started from the phase-163 clone:
+
+```
+env KILOBOT_MODE=rl KILOBOT_SMOKE=0 KILOBOT_ITERATIONS=300 KILOBOT_DEVICE=cuda \
+    KILOBOT_INIT_ACTOR=../results/bc_v2/run_r0/actor_best.pt \
+    KILOBOT_ACTOR=gru_split_observation KILOBOT_SPLIT_ACTIVATION=elu \
+    KILOBOT_HEARTBEAT_TICKS=48 KILOBOT_MIN_BOTS=40 KILOBOT_MAX_BOTS=60 \
+    KILOBOT_TARGET_SHAPING=5.0 KILOBOT_STOP_BONUS=1.0 KILOBOT_STOP_RADIUS=0.05 \
+    KILOBOT_GLOBAL_SHAPING=0.5 KILOBOT_ENTROPY_COEF=0.001 \
+    KILOBOT_QUIET_MSG_HEAD=1 KILOBOT_MSG_LOG_STD=-4.0 KILOBOT_LOG_STD_MIN=-4.0 \
+    KILOBOT_SWARM_RNG=500 KILOBOT_MIN_START_COV=0.4 \
+    KILOBOT_FORMATIONS=../data/formations python launch.py
+```
+
+Baseline to beat: `results/bc_v2/eval_r0_head.json` (run_r0 head-only,
+coverage 0.743 / stopped 0.945 / settled<5u 0.516) and the hybrid-gate
+variant (0.706 / 0.856 / 0.428) on the same 10-arena/10k-tick
+`eval_closed_loop.py` + `settle_report.py` harness, paired
+`--swarm-rng 500 --seed 7`, `--bake-rotation-steps 0`. Select checkpoints on
+the closed-loop settle rate, never on a tape score (phase 159: the two are
+anti-correlated). Attribution: a frozen-message-head run
+(`KILOBOT_LOG_STD_MIN == KILOBOT_LOG_STD_MAX` on the message dims, or
+`head_msg` re-zeroed each step) is the ablation that says whether the gains
+came from learned messaging at all.
+
+## 2026-10-09 (phase 165): the reward reworked around the robot's OWN pixel -- accuracy income, explicit speed, and the any-pixel income dropped
+
+Direct request from the project owner: "reward a robot for finding its
+specified pixel... reward the desired behavior of the robot figuring out its
+own position and moving to its desired location as accurately as possible,
+and (if possible) as quickly as possible." This replaces phase 164's
+v1 reward, which kept the coverage-derived base income additive alongside
+the new terms -- a mixture this phase now names a mistake waiting to happen:
+phase 159 established that any-pixel coverage is not the objective, so
+paying r_on for occupying SOMEONE's pixel while shaping toward the robot's
+OWN pixel sets the two gradients against each other exactly where they
+disagree (near the shape, away from one's own point).
+
+### The reworked reward, per robot per tick
+
+`KILOBOT_REWARD_MODE=target` (new mode, alongside normal/speed/steer):
+
+1. **Accuracy income** `w_acc * exp(-(d_i/sigma_acc)^2) * dt` -- per-step
+   income for BEING at the robot's own assigned pixel, tightest arrivals
+   most, effectively zero beyond ~3 sigma. Localization is rewarded
+   instrumentally -- a robot that has not figured out where it is cannot
+   find the pixel -- and deliberately NOT by a confidence bonus: phases
+   2/9's measured lesson was that paying for confidence directly makes a
+   confidently-wrong cloud profitable.
+2. **Speed, twice over**: the gamma discount makes earlier accuracy income
+   worth more (arrival time is inside the return), plus an explicit
+   carrying cost `w_time * dt` (`KILOBOT_TARGET_TIME_COST`) charged only
+   while the robot is unsettled (true distance past stop_radius). Getting
+   this conditional right is load-bearing and was initially wrong here:
+   an UNconditional per-step constant is a policy-gradient no-op -- every
+   equal-length trajectory pays the identical total, the value baseline
+   absorbs it exactly, and no advantage changes; only the conditional
+   version (settling at tick 100 vs 1000 differs by 900 charged ticks) is
+   a real gradient. The relief bar is TRUE distance, not the latch flag,
+   so a robot the gate falsely latched far away keeps paying -- wrong
+   parking buys no cost relief.
+3. **Target shaping** `k*(prev_d - gamma*d_i)` -- unchanged from phase 164,
+   and still necessary: gamma's effective horizon is ~100 steps, so the
+   dense shaping term carries the approach gradient the terminal income
+   cannot reach back to. Policy-invariant, not annealed.
+4. **Shared smooth potential** `k_g*(prev_pot - gamma*pot)`, `pot =
+   mean_i exp(-(d_i/sigma_g)^2)` -- the sender-credit term re-based on a
+   smooth kernel. Phase 164's threshold version (fraction within
+   stop_radius) was flat almost everywhere: a sender whose message improves
+   a neighbour from 12 to 6 units would have earned nothing, because no
+   robot crossed the bar that tick. The kernel moves at every distance --
+   mid-approach included, which is where a helpful message actually does
+   its work. sigma_g (0.10) deliberately wider than sigma_acc (0.05).
+5. **Graded stop bonus** `B * exp(-(d/stop_radius)^2)`, paid the tick after
+   the frozen gate latches. Phase 164's cliff (1.0 inside 0.05, 0 outside)
+   replaced: the kernel keeps a gradient between the tolerance bands and
+   pays full bonus only for tight arrivals; a gate false positive far from
+   the pixel earns ~nothing (exp(-64)), so the bonus still cannot reward
+   parking in the wrong place.
+6. **Separation kept; r_on/off_penalty/pack dropped** in this mode. The
+   separation term spreads robots along the stroke (the hash assignment
+   gives different pixels; crowding is the failure), which serves the
+   settle objective; the any-pixel terms do not.
+
+`KILOBOT_SUCCESS_METRIC=settled` (new): the success/reset `cov` becomes the
+settled fraction (same bar as the stop bonus) instead of coverage -- the
+phase-153 variable-repurpose pattern, with the same honest cost: the
+`oracle_cov`/`mean_final_coverage` log names then mean settled fraction.
+Aligning arena recycling with the objective also fixes phase 164's own
+recipe bug: its `KILOBOT_MIN_START_COV=0.4` would have aborted any real run
+at iteration 0 (spawn coverage is ~0.286 by chance; a settled bar at spawn
+is far lower).
+
+### Where this leaves the goal
+
+All terms share one distance -- each robot's own assigned pixel, resolved
+through the same `ensure_target` cache its proprioception uses -- so reward
+and observation cannot disagree about what "its pixel" means, and the
+python-side geometry is immune to the baked-field rotation. 13 tests in
+`tests/test_target_reward.py` (accuracy kernel, time cost, smooth potential,
+graded bonus, settled success, mode switch); suite 277 passed. Smoke run
+against a real player: 2 arenas, 12-14 bots, warm start from run_r0, quiet
+message head, all new terms live, coverage climbed 0.25 -> 0.35 over three
+smoke iterations.
+
+The real run (from `python/`, warm-started from the phase-163 clone):
+
+```
+env KILOBOT_MODE=rl KILOBOT_SMOKE=0 KILOBOT_ITERATIONS=300 KILOBOT_DEVICE=cuda \
+    KILOBOT_INIT_ACTOR=../results/bc_v2/run_r0/actor_best.pt \
+    KILOBOT_ACTOR=gru_split_observation KILOBOT_SPLIT_ACTIVATION=elu \
+    KILOBOT_HEARTBEAT_TICKS=48 KILOBOT_MIN_BOTS=40 KILOBOT_MAX_BOTS=60 \
+    KILOBOT_REWARD_MODE=target KILOBOT_TARGET_ACC_WEIGHT=1.0 \
+    KILOBOT_TARGET_ACC_SIGMA=0.05 KILOBOT_TARGET_TIME_COST=0.1 \
+    KILOBOT_TARGET_SHAPING=5.0 KILOBOT_STOP_BONUS=1.0 KILOBOT_STOP_RADIUS=0.05 \
+    KILOBOT_GLOBAL_SHAPING=0.5 KILOBOT_SUCCESS_METRIC=settled \
+    KILOBOT_ENTROPY_COEF=0.001 KILOBOT_QUIET_MSG_HEAD=1 \
+    KILOBOT_MSG_LOG_STD=-4.0 KILOBOT_LOG_STD_MIN=-4.0 KILOBOT_SWARM_RNG=500 \
+    KILOBOT_FORMATIONS=../data/formations python launch.py
+```
+
+Baseline to beat: `results/bc_v2/eval_r0_head.json` (run_r0 head-only,
+coverage 0.743 / stopped 0.945 / settled<5u 0.516) and the hybrid-gate
+variant (0.706 / 0.856 / 0.428) on the 10-arena/10k-tick
+`eval_closed_loop.py` + `settle_report.py` harness, paired
+`--swarm-rng 500 --seed 7`, `--bake-rotation-steps 0`. Select checkpoints on
+the closed-loop settle rate, never on a tape score (phase 159: the two are
+anti-correlated). Attribution: a frozen-message-head run
+(`KILOBOT_LOG_STD_MIN == KILOBOT_LOG_STD_MAX` on the message dims, or
+`head_msg` re-zeroed each step) is the ablation that says whether the gains
+came from learned messaging at all.
+
+Two things to watch first, both failure modes the log has already taught us
+to expect: the time cost and accuracy income are new value-landscape for a
+warm-started critic (fresh, so no stale-value trap, but watch
+`explained_variance` recover over the first iterations), and the entropy
+bonus will push the message log-std up from -4.0 -- desirable (that is the
+message space opening), but if receivers' navigation degrades as it rises,
+the quiet-start assumption was wrong and `KILOBOT_MSG_LOG_STD` should be
+swept rather than fixed.
+
+## 2026-10-09 (phase 166): a theory audit of the phase-165 reward before the first real run -- two fixes, three documented-with-magnitudes
+
+Direct request from the project owner: critically analyze the reward for
+theoretical soundness before committing GPU time. Every term was checked
+against the MDP formalism (reward as r(s) / r(s,a,s'), PBRS invariance
+conditions, terminal/cut conventions, credit routing) and against the
+implementation. Findings, in the order that matters:
+
+### Fixed 1: the quiet message start only DELAYED the entropy climb
+
+The entropy bonus pushes every dimension's log-std toward LOG_STD_MAX (=0,
+std 1.0). Motor dims have a strong, fast counter-signal -- a noisy motor
+sample loses reward on the very next tick, which is exactly why phase 9's
+entropy_coef=0.001 fixed the std-pinning there. Message dims have the
+weakest counter-signal in the system: a sender's credit for a good message
+reaches its own return only through the receivers' shared potential,
+diluted ~1/m and delayed. Left alone, message std climbs toward 1.0 over
+the run and the receivers' Tc input degenerates into uniform noise -- the
+exact corruption the quiet start was built to prevent, arriving slowly.
+`KILOBOT_MSG_LOG_STD_MAX` (policy.py, env-only like its siblings) caps the
+message dims' effective std separately; the cap is applied in `_std`, so
+the entropy bonus structurally cannot push past it (zero gradient where
+binding). Unset = the global ceiling, so no existing behavior changes.
+
+### Fixed 2: the stop bonus could be mined by release/re-latch cycling
+
+With `arrived_release_threshold > 0` (the phase-163 evals used 0.5), a
+latched robot can release and re-latch. A robot AT its pixel whose arrived
+logit oscillates across the hysteresis band would collect the graded bonus
+every cycle. Benign for the settle metric (the robot is at its pixel
+either way) but a standing incentive for confidence oscillation. The bonus
+is now paid once per robot per episode (`worker.stop_bonus_paid`, cleared
+on reset). With release 0.0 (the recipe's default) the latch is permanent
+and the guard is a structural no-op -- belt and suspenders, so the eval
+recipe's own 0.5 cannot open the vector.
+
+### Documented, with magnitudes: the PBRS boundary conventions
+
+Exact policy invariance for potential-based shaping requires conventions
+at episode boundaries that this implementation approximates:
+
+- **Reset boundary**: `prev_target_dist` is cleared on arena reset, so the
+  shaping sum loses its +k*d_0 opening term (no shaping on the first step
+  after reset, matching reward_shaping's own convention).
+- **Terminal step**: F_T = k(d_{T-1} - gamma*d_T) everywhere, including
+  successful termination, where the canonical convention is phi(terminal)=0
+  (F_T = k*d_{T-1}, no gamma).
+
+Both leaks are O(k(1-gamma)*d) = 5% of one unit of distance at k=5 --
+against an income scale of ~41 per episode (0.02/step over 2048 steps).
+They are also state-dependent constants the critic absorbs, and their
+direction is ALIGNED with the objective (ending far is mildly penalized).
+Verdict: not worth restructuring `_record_snapshots`' ordering for; the
+convention is documented here so it is a decision, not an oversight.
+
+### Documented: success threshold semantics under `success_metric=settled`
+
+`KILOBOT_SUCCESS_THRESHOLD=0.85` then applies to the settled fraction --
+but the ORACLE itself settles a median 40% within 5u (best arena 83%,
+phase 159), so 0.85 means "success resets essentially never fire; arenas
+recycle on timeout". Not harmful (PBRS and the buffer's cut/term handling
+make timeout-driven recycling fine), but it should be a conscious choice:
+0.5 is the value that makes success resets meaningful for the settled
+metric. Related: training episodes run max_episode_steps=2048 while the
+eval harness runs 10000 ticks -- robots that would settle at tick 3000
+never experience settling in training. The shaping term carries their
+gradient regardless, but a longer episode budget is the first knob to try
+if settle rates in training lag the eval's.
+
+### Documented: sender credit dilution
+
+The shared potential's improvement from one robot's message lands in the
+sender's own return scaled by k_g/m (~0.01 for k_g=0.5, m=50). This is the
+known CTDE credit-assignment cost, not a bug; k_g is the knob, and raising
+it adds the variance of everyone's progress to everyone's return. Do not
+raise it to fix a silent message head -- diagnose with the frozen-head
+ablation first.
+
+### Checked and found sound
+
+Privileged true distance in the reward (legitimate; the actor is never
+given it); all terms are r(s) or r(s,a,s') forms, so the Markov property
+holds (a constant per-step cost is Markovian; an UNconditional one is
+worse than non-Markovian -- it is a policy-gradient no-op, fixed in phase
+165); both shaping terms are exact PBRS with PPO's own gamma; reward and
+observation share one geometry (formation_pool frame, verified against the
+oracle's closed-loop numbers); NaN distances never reach the reward; the
+Hilbert assignment gives distinct pixels (300 points, m <= 60); the
+latch+1 payment delay is one tick of credit shift, negligible; float32
+underflow in the kernels reaches exactly 0.0, never NaN.
+
+Suite: 285 passed (16 reward tests in tests/test_target_reward.py).
+
+### Phase 166 addendum: the TensorBoard surface reworked -- 60+ charts down to ~20, one reading order
+
+The scalar surface was investigation-era: 24 ppo/motor keys (pre-activation
+means, parameter drifts, per-part timings -- the phase-6..9 debugging
+instruments), all seven histograms, and reward components logged for a mode
+that no longer pays them. Reworked as a projection, not a rewrite:
+`merge_stats`/`build_stats` still return the FULL dict (RunSummary and the
+sweep consume it, so sweep compatibility is untouched); `tb_view(stats, cfg)`
+is what TensorBoard receives, with an explicit rename map into one reading
+order -- `objective/` (settled fraction, success rate, episode reward),
+`reward/` (only the terms actually active; the any-pixel income charts are
+dropped in target mode), `optim/` (policy/value/entropy/kl/clip/EV),
+`grads/motor` and `grads/message` (the message-learning charts),
+`policy/std_message` and `policy/std_motor` (EFFECTIVE per-kind std, after
+the clamp stack -- replaces the raw-parameter means), `diag/`
+(on_shape_fraction_any_pixel, belief conf/localized, seed fraction,
+decision rate), `time/` (two keys). Unknown keys pass through, so future
+tags stay visible by default; bc.py's own logging path is unchanged. The
+console line is objective-first and nan-safe: `settled/succ/stop(n-missed)/acc
+| pol/val/ent/kl/ev | msg_g std_m/i | sps`. Histograms trimmed to three
+(message samples, motor samples, log-std parameter). tools/compare_runs.py
+parses BC-specific lines, not the RL console line, so it is unaffected.
+
+## 2026-10-09 (phase 167): first real iteration read rigorously -- the learned-head-only gate stranded 69 robots, and the quiet start un-quiets itself under Adam
+
+First full-scale iteration (4 workers x 1024 rollout steps, 9 arenas, ~44
+bots/arena): collect 95.9s + PPO 78.8s, ev 0.46 at iter 0, r_step positive
+-- the machine copes and the shaping gradient works. Three findings from
+the numbers themselves:
+
+### Finding 1: `stop 2(-69)` -- the gate as launched was the learned head ALONE, and it stranded 69 robots
+
+71 latches in the first rollout; 69 paid nothing (true distance > ~18.6
+units from the pixel, where the graded bonus's exp(-(d/0.05)^2) drops
+below 1e-6). The launch command omitted
+`KILOBOT_USE_CLOSED_FORM_ARRIVED`/`KILOBOT_CLOSED_FORM_HYBRID` -- phase
+161's own finding, re-measured live: head-only fires on the localization
+shift, and with `arrived_release_threshold=0.0` (the default) every wrong
+latch is PERMANENT -- motors zeroed, never recoverable, a poisoned data
+source for every remaining iteration. Corrected launch: the hybrid gate
+(dist 0.08, the measured value) plus release 0.5, so a wrong latch is
+recoverable hysteresis rather than a trap.
+
+### Finding 2: `kl 25.44` -- the quiet message start un-quiets itself in one iteration
+
+Adam's updates are scale-free: with a consistent +/- gradient, untrained
+weights random-walk to O(lr * sqrt(steps)) regardless of gradient
+magnitude. One iteration is 4 epochs x 864 minibatches, so the zeroed
+head_msg walked to ~O(0.1) mean shift while the stored samples sit within
+the message std (0.02) -- and the low std amplifies log-prob sensitivity
+by 1/std^2. The message channel is noise by iteration 1 no matter what the
+quiet start does, which defeats the entire point of matching the BC
+tapes' zero-broadcast input distribution. Fix: a separate learning rate
+for the message head (`KILOBOT_MSG_LR`, make_actor_opt's param group) --
+slower walk AND slower learning together, the right shape for a head
+whose value signal arrives diluted ~1/m and delayed; it should learn over
+tens of iterations. Paired with msg log-std -3 (samples +/-0.05,
+commensurate with the slowed walk).
+
+### Fixed: the startup coverage warning was mis-wired for the settled metric
+
+`check_startup_coverage` warned "encoder or formations may not have loaded"
+at iter-0 settled 0.003 -- expected, not a load failure: the 0.286 chance
+floor belongs to any-pixel coverage, which the settled fraction is not.
+The warning now fires only under success_metric=coverage; the
+min_start_cov abort is honoured under both metrics.
+
+Suite: 290 passed. Both fixes are in the corrected launch; the poisoned
+first run (69 stranded robots) is discarded.
+
+### Phase 167 addendum: the training-eval divergence that was grinding robots -- arrived_freeze_hidden had no launch.py wiring
+
+Ten iterations of the horizon-8000 run looked like a dead localization
+pipeline: conf_pos 0.004 and falling, frac_localized < 1%, any-pixel
+coverage BELOW the 0.286 spawn floor (0.155-0.22), settled flat at 0.002,
+while mean_disparity... mean_displacement measured ~0.0008 -- FULL speed.
+Robots were driving fine and never localizing, and the run's own stop
+counts (300-400 far latches per iteration) named the mechanism.
+
+The gate was the launch.py/env-var divergence this project has hit before,
+in a new place: `arrived_freeze_hidden` (Config default TRUE) had NO
+env-var wiring in launch.py at all -- so every launch.py-launched run
+silently ran with the GRU frozen while a robot is latched. Every eval
+harness in this project ran it OFF (the offline pipeline's tools default
+it off, phase 156: "a frozen recurrence at deployment is one the training
+never saw" -- bc_offline trains the arrived stretches with the recurrence
+running). With the release hysteresis (phase 167's release 0.5) the two
+compose into a robot grinder: a wrongly-latched robot's motor goes to
+zero, its observations stop changing, its frozen GRU's arrived logit never
+drops back below the release bar, and it strands permanently -- 25% of the
+swarm frozen at wrong places per episode, dragging conf_pos (population
+average over frozen cold filters) to 0.004, coverage below spawn, and
+settled to noise. The phase-161/163 eval numbers the warm start is
+supposed to beat (0.516 settled<5u) were measured with this OFF.
+
+`KILOBOT_ARRIVED_FREEZE_HIDDEN` now exists and defaults still to Config's
+True (no existing run changes behaviour); the RL recipe sets it to 0 so
+release actually releases. Lesson, same family as the spawn-heading
+column and the phase-163 eval-path pool gap: any Config field that an
+eval harness sets one way and launch.py cannot be told to set another
+way is a standing divergence risk.
+
+## 2026-10-11 (phase 168): the transmission fine-tune made to train at all -- five measured root causes of the warm-start collapse, the beacon architecture, and the honest first result
+
+Goal, user's own words: the robots were cloned off a transmission-free
+oracle; now they should "learn how to transmit information to quicker
+speed up the process of them finding where they are", warm-started from
+`results/bc_v2/run_r0`. Every previous attempt (phases 164-167 and two
+fresh attempts this phase) collapsed the warm start into noise within
+iterations. This phase found and fixed five distinct, measured root
+causes, built the beacon-learning machinery, and produced the first RL
+run in the project's history that trains stably -- plus an honest
+attribution of what the learned transmission does and does not buy.
+
+### Root cause 1: the warm start was executed at std 0.61
+
+A bc_offline checkpoint's saved `log_std` is a placeholder
+(`Config.log_std_init = -0.5`, std 0.61): BC only ever fits the MEAN, and
+every eval harness runs deterministic actions (squash of the mean), so the
+placeholder is never executed anywhere but RL's stochastic rollout. The
+first stochastic collection therefore drove the swarm on
+0.5*(tanh(N(mean, 0.61))+1) per wheel -- random wheel speeds -- and the
+warm start was dead at iteration 0, before any PPO update (measured in
+`results/rl_v1_console.log`: settled 0.002 from iter 0, std_m/i
+0.05/0.61, while the same weights under deterministic eval score
+settled<5u 0.63). The collapse the reward functions were blamed for was,
+to first order, action-sampling noise. `KILOBOT_MOTOR_LOG_STD` (config
+motor_log_std, applied in launch.apply_warm_start_message_policy) starts
+motor exploration quiet (std 0.082) instead.
+
+### Root cause 2: the phase-164/165 sender credit was paying for the swarm getting WORSE
+
+The shared arena potential is a higher-is-better kernel, and the
+phase-164/165 code computed `k*(prev_pot - gamma*pot)` -- the exact
+negative of the PBRS form. A helpful broadcast that raised the potential
+PENALIZED its own sender; degradation paid. It went unnoticed for two
+phases because every distance-shaped term in the file (reward_shaping,
+target_shaping) uses a lower-is-better quantity, for which
+(prev - gamma*curr) IS correct. Fixed to `k*(gamma*pot - prev_pot)` and
+caught by a unit test (`test_global_shaping_belief_band_credits_without_
+target_resolution`). The potential also gained a second band (see below).
+
+### Root cause 3: the settled kernel could not see the phase a beacon actually speeds up
+
+The settle curve (phase 163, re-measured this phase) spends its first
+~3000 ticks localizing: settled<5u is 0.016 at tick 2000, 0.63 at 8000.
+The phase-165 potential kernel (sigma 0.10 on own-target distance) is
+exp(-25) at d=0.5 -- structurally flat across that entire phase, so the
+sender credit for "a message that helps a neighbour figure out where it
+is" was zero exactly when the message does its work. The arena potential
+is now two bands (`reward.arena_potential`): the settled kernel plus a
+belief-error kernel exp(-(e_i/0.20)^2), e_i = |filter mean - truth| --
+privileged like every reward quantity, correctness-grounded (a
+confidently-wrong cloud keeps e large and earns nothing, which is the
+property phases 2/9 demanded after the conf bonus rewarded wrong
+convergence), and moving from the first landmark fix onward. A per-robot
+PBRS on the same error (`KILOBOT_BELIEF_SHAPING`, k*(prev_e - gamma*e)
+with a BOTH-sides NaN mask -- the one-sided mask NaN'd the reward for 7
+of 46 robots at the tick their belief first existed) reinforces the
+clone's landmark-seeking behavior.
+
+### Root cause 4: the RL filter was never the filter the clone was trained on
+
+`eval_closed_loop.py` and `run_bc_monitored.py` both set
+`oracle_known_start_heading = True`; launch.py's RL path defaults it to
+False and no recipe ever set it. With it off, the training-time particle
+filter starts with uniformly random per-particle headings, never
+localizes (belief error CLIMBING through every episode, frac_localized
+under 1%), and feeds the clone belief features it never saw -- the same
+signature as phase 167's addendum, which attributed it to the
+freeze-hidden bug alone. Set `KILOBOT_ORACLE_KNOWN_START_HEADING=1` and
+the same run localizes and settles.
+
+### Root cause 5: per-robot caches leaked across arena resets
+
+`_reset_arena` reused local indices for brand-new robots while
+`_spawn_heading_cache`, `turn_anchor`, `belief_fit`, `belief_anchor` and
+`_stable_belief_heading` kept the previous robots' entries. With root
+cause 4 fixed this turned into the episode-2 collapse: every robot after
+the first episode was told the previous robot's spawn heading and could
+never localize (belief error above spawn level from tick one of every
+episode after the first). Eval harnesses never reset arenas mid-run,
+which is why only training ever saw it. All are popped on reset now
+(unit-tested through _reset_arena itself).
+
+### The beacon architecture (making a learned protocol learnable at all)
+
+- `KILOBOT_MSG_HEAD_PROP_INPUT` (config msg_head_prop_input): head_msg
+  reads cat([g, prop]) instead of g. The honest beacon is a readout of
+  the robot's own filter state (x_m, y_m at prop[8]/[9], conf_pos*r at
+  prop[12]*[13]) -- but the motor-trained GRU trunk does not carry
+  absolute position (measured: a head-only fit on the frozen clone's g
+  plateaus at 0.5 normalized position error, 50 units against a 7-unit
+  IR range). Pulling position through the shared trunk instead was the
+  first wrecking ball: kl 1 -> 10 per iteration, motor mean drift 0.09
+  (the oracle's steering differential is 0.0093 rms), belief error
+  0.62 -> 0.82 within five iterations. With prop as a head input the
+  beacon is a linear readout; the warm-start loader (launch.warm_start_
+  load) tolerates exactly the head_msg shape change and nothing else.
+- The readout is installed as the head's INITIALIZATION (slope 1.3/1.3/
+  2.0 on the position/conf columns, slots 3-8 zero), so beacons start as
+  the honest protocol: a robot broadcasts its believed position with its
+  own confidence, and the receiver-side fusion gate (PEER_CONF_MIN) is
+  what keeps unlocalized senders silent.
+- `KILOBOT_MSG_SUPERVISION` (ppo.py): an auxiliary loss holding slots
+  0-2 at the honest beacon, evaluated through
+  kilobot_gnn.message_mean_headonly -- the trunk is STOPPED, so the
+  prior can never re-purpose the motor policy. Supervised in ACTION
+  space, not pre-tanh: an atanh target (up to 3.8 for conf 0.999) ground
+  the conf mean ~1.8 units uphill through a std-0.05 Gaussian and
+  exploded the KL on exactly the slot that was already right.
+- The 1/sigma^2 amplification: quiet stds (0.05-0.082) multiply every
+  policy gradient into the shared trunk by 150-400x. ACTOR_LR=2e-5 and
+  PPO_EPOCHS=2 keep the per-update drift inside the clone's steering
+  precision; the message std starts at its cap (0.082).
+- `KILOBOT_BEACON_HONESTY`: a per-tick reward penalty on broadcasting
+  conf above the sender's own honest filter confidence
+  (reward.beacon_overclaim_penalty -- claimed read from the transmission
+  node column, honest from own particles). Added after the first
+  transmission run measured PPO pushing the conf gate to 2.4x honest
+  (24% of decisions past PEER_CONF_MIN vs an honest 10%; 14% of beacons
+  from unlocalized senders, ~50-unit-wrong positions), and the receiver
+  fuses the MOST confident valid row, so the liar always wins the slot.
+  The action-space supervision cannot hold the slot down -- its gradient
+  vanishes at tanh saturation (tanh'(2.0) ~ 0.02) exactly where conf
+  sits -- so the constraint has to ride the same advantage channel.
+  Honest caveat: at weight 4.0 the learned conf statistics barely moved
+  (ON 0.244 vs 0.241); part of the apparent overclaim is the readout's
+  own slope-2 conf mapping (effective gate ~ honest 0.65, claims
+  accurate to ~0.11), and the penalty's residual effect is unproven.
+
+### The runs (all `scripts/train_rl_transmission.sh`, 4 workers x 1024 steps, 9 arenas, horizon 8000)
+
+- v3/v4 (100 iterations, no honesty penalty): stable throughout -- every
+  episode localizes (belief error 0.62 -> 0.20) and settles (window-mean
+  settled rising to 0.20-0.26 per episode), stop bonuses paid 200-330 per
+  iteration against ~20-40 missed, kl 0.02-0.15, ev reaching 0.98. The
+  first RL run in this codebase that does not collapse.
+- v5 (40 iterations, honesty penalty): same stability; the no-comms
+  export BEATS the BC clone baseline on the standard 4-arena/8000-tick
+  harness (`--swarm-rng 500 --seed 7`, hybrid gate, release 0.5):
+
+| driver | settled<5u | median err | tick-4000 settled |
+|---|---|---|---|
+| A: BC clone (eval_bcclone) | 0.631 | 4.6 | 0.285 |
+| B': v5 actor, comms OFF | **0.677** | 3.6 | **0.331** |
+| C': v5 actor, comms ON | 0.483 | 4.7 | 0.216 |
+| D: clone + honest beacons (v4 control) | 0.555 | 4.6 | 0.242 |
+
+### The honest attribution
+
+1. The reward function now works: the fine-tune is stable, and without
+   the channel it improves the clone (0.677 vs 0.631, faster too at
+   every tick past 3000). The warm-start collapse is solved.
+2. The transmission policy trains and its protocol is live: beacons
+   fire, receivers fuse them, and localization measurably accelerates in
+   training (with comms, robots stop EARLIER: stopped 0.973 vs 0.956 by
+   tick 8000 -- the closed-form gate fires on the faster-rising conf).
+3. But on the settle metric the channel costs, consistently, ~0.13-0.19
+   -- for the LEARNED beacons (C' 0.483) and for the FIXED honest
+   protocol on the clone (D 0.555) alike. The config.py warning that
+   belief_comms "still double-counts correlated information" is thereby
+   quantified: even an honest beacon channel is net-negative on this
+   harness as implemented, before any learning. The learned content adds
+   the conf-slope effect on top (semi-localized senders broadcasting
+   ~0.11-accurate claims that win the argmax fusion slot).
+4. Attribution knob for whoever continues: a no-comms training control
+   (KILOBOT_BELIEF_COMMS=0) was not run; the in-training settled numbers
+   therefore do not separate "fine-tune" from "channel" -- only the eval
+   table above does.
+
+### Where this leaves the goal
+
+The pipeline trains a transmission policy end to end and the recipe is
+`scripts/train_rl_transmission.sh`. To make the channel pay on the
+settle metric, the measured order of attack: (a) the fusion machinery
+itself -- the receiver's argmax-most-confident selection and the
+stale-row retention that belief.py's own comments warn about; (b) the
+conf slope (a readout that maps conf honestly rather than through
+tanh(2c), or a receiver gate above 0.85); (c) the input-distribution
+shift on tc[0:9], which D isolates from any learning. The
+`KILOBOT_MSG_LOG_STD_MAX` cap, the quiet start, and the frozen stop gate
+all behaved as designed across all runs.
+
+Suite: 303 passed (13 new tests: belief errors/kernels, both-sides NaN
+mask, sign-corrected shared potential, action-space supervision with a
+trunk-stopped gradient, readout init, warm-start tolerant load, honest
+confidences, overclaim penalty, reset clearing, msg std behavior).
+
+## 2026-10-11 (phase 169): stage A of the transmission plan -- the wrong-stop decomposition, the wavefront protocol frozen on the clone, and the attribution that reorders the attack
+
+Stage A of the plan drawn at the end of phase 168: no training, eval-only
+knobs, each candidate mechanism frozen onto the BC clone
+(`results/bc_v2/run_r0/actor_best.pt`) and run on the standard paired
+harness (4 arenas / 8000 ticks, `--swarm-rng 500 --seed 7`, hybrid gate,
+release 0.5). One new measured number reframed everything first.
+
+### The wrong-stop decomposition of the phase-168 evals
+
+`eval_closed_loop.py`'s per-tick samples already carry stopped flags and
+true per-robot distances, so `stopped - settled<5u` is computable without
+any new instrumentation. Re-reading the phase-168 runs with it:
+
+| driver | stopped | settled<5u | stopped-wrong |
+|---|---|---|---|
+| B': v5 actor, comms OFF | 0.956 | 0.677 | 0.279 |
+| C': v5 actor, comms ON | 0.973 | 0.483 | 0.490 |
+
+The channel does not slow navigation -- it nearly doubles false-positive
+terminal arrivals. The causal chain: peer rings shrink the cloud's spread
+(conf rises faster) AND bias its mean (the ring is centered on the sender's
+CLAIMED mean but ranged to the sender's TRUE position); the closed-form
+gate (`dist < 0.08 AND conf >= 0.4`, hybrid OR the learned head) fires
+terminally on the inflated conf while the mean is still off. The settle
+metric counts only stopped-and-right, so this is the channel's entire
+measured cost. It also reframed the objective: the settle bottleneck is
+wrong terminal stops (0.28-0.33 even with the channel OFF), and any
+mechanism that inflates conf without improving the mean manufactures them.
+
+### The knobs (all eval-time, default off, all launch- and eval-wired)
+
+- `tc_peer_zero` / `KILOBOT_TC_PEER_ZERO`: zero a peer row's message
+  content (slots 0-8) in the actor's Tc, keeping only strength. Wall-seed
+  rows (negative senderId, real landmark positions) are untouched. The
+  beacon then reaches a receiver only through its belief filter, never
+  through the motor trunk's input.
+- `beacon_arrived_only` / `KILOBOT_BEACON_ARRIVED_ONLY`: the honest-beacon
+  override writes slots 0-2 only when the robot's (protected) arrival latch
+  has fired; moving robots are explicitly zeroed -- an untrained head_msg
+  output left in slots 0-2 is random noise that can clear PEER_CONF_MIN and
+  fuse a garbage ring into every nearby filter, worse than silence. The
+  arrival gate now runs BEFORE the beacon write, so a robot the gate is
+  still refusing to confirm never broadcasts.
+- `peer_innovation_min` / `KILOBOT_PEER_INNOVATION_MIN`: add_peer_range
+  fuses the chosen ring only if at least this fraction of the receiver's
+  particles lie within 2*sigma of it; otherwise the ring is simply absent
+  this tick.
+- `arrival_min_anchored` / `KILOBOT_ARRIVAL_MIN_ANCHORED`: the latch
+  (closed-form and learned head alike) requires one direct seed/wall
+  sighting this episode (`worker.belief_ever_anchored`, tracked from the
+  same full observation channels the filter itself consumes on decision
+  ticks). Chained peer claims alone are hearsay; a terminal stop on
+  hearsay is how a wrong beacon propagates one hop per victim.
+- `arrival_persist` / `KILOBOT_ARRIVAL_PERSIST`: the condition must hold on
+  this many consecutive decisions before the latch fires; a conf pumped up
+  by this tick's ring is transient, a belief genuinely parked on its pixel
+  keeps satisfying the condition. Never releases an existing latch.
+
+Reset hygiene: `belief_ever_anchored` and `_arrival_persist` are per-robot
+dicts keyed by arena, and are popped by `_reset_arena` with the same list
+that fixed the phase-168 episode-2 collapse -- a stale "ever anchored" is
+the previous robot's evidence. 11 new unit tests
+(`tests/test_phase169_protocol.py`); suite 314 passed.
+
+### The runs (all `tools/eval_closed_loop.py`, clone weights, paired harness)
+
+| driver | settled<5u | tick-4000 | stopped | stopped-wrong | med err |
+|---|---|---|---|---|---|
+| A: clone, comms off (phase 168 table) | 0.631 | 0.285 | 0.956 | 0.325 | 4.6 |
+| B': v5 actor, comms OFF | 0.677 | 0.331 | 0.956 | 0.280 | 3.6 |
+| C': v5 actor, comms ON | 0.483 | 0.216 | 0.973 | 0.490 | 4.7 |
+| D: clone + honest beacons (status quo protocol) | 0.555 | 0.242 | 0.986 | 0.431 | 4.6 |
+| A1: D + tc-peer-zero | 0.563 | 0.261 | 0.963 | 0.400 | 4.5 |
+| A2: clone + arrived-only beacons + innov gate 0.05 + protection | 0.591 | 0.277 | 0.965 | 0.374 | 4.0 |
+| A3: A2, innovation gate 0.20 | 0.591 | 0.277 | 0.965 | 0.374 | 4.0 |
+| A4: A2, arrival-persist 3 | 0.594 | 0.291 | 0.965 | 0.371 | 4.0 |
+| A7: A2 with the gate set to 1.1 -- NO ring fusion at all | **0.691** | **0.310** | 0.965 | **0.273** | ~4.0 |
+
+### The honest attribution
+
+1. **The policy input shift was not the harm.** A1 differs from D only by
+   the Tc zeroing and recovers 0.008 of D's 0.076 deficit (0.563 vs
+   0.555). Phase 168's "input-distribution shift on tc[0:9]" is real but
+   small; the channel's damage goes through the FILTER path.
+2. **Ring fusion is the whole remaining harm, and it is threshold-robust.**
+   A2/A3/A4 (fusion on, gate 0.05/0.20, persist 2/3) sit at 0.591-0.594 --
+   a flat ~-0.10 against A7 (same stack, fusion off, 0.691). Stricter
+   consistency gating cannot fix it, and for a structural reason: the
+   gate can only veto rings for clouds that are already structured, but a
+   spread cloud -- exactly the receiver a beacon is meant to help --
+   covers any nearby ring band, true or false, at the same ~0.6 fraction.
+   Consistency is blind where fusion actually acts. And the sender pool
+   poisons the prior: a wrong-latched robot (0.37 of the stopped in A2)
+   broadcasts a conf~1.0 claim indistinguishable from an accurate one,
+   the argmax picks among equal-confidence rows arbitrarily, and the
+   0.12 sigma floor lets each wrong pull move a spread receiver ~1 sigma.
+3. **The arrival-latch protection is an independent, comms-free win.** A7
+   differs from A only by machinery that ends up INERT for the filter
+   (beacons written but never fused) plus the latch protection and the
+   Tc cleanup: settled 0.691 vs 0.631, tick-4000 0.310 vs 0.285,
+   wrong-stops 0.273 vs 0.325. The clone + protection stack beats the BC
+   clone on BOTH speed and accuracy without any working transmission --
+   which is now the bar, not 0.631.
+4. **What this reorders:** the phase-168 "order of attack" said (a) fusion
+   machinery, (b) conf slope, (c) input shift. Measured: (c) is worth
+   0.008, (b) is moot for a sender pool that saturates at conf~1, and (a)
+   is the whole 0.10 -- but not fixable by gating per-ring consistency.
+   The discriminator a spread receiver can actually use is SECOND-ORDER:
+   two rings from DISTINCT senders that agree (both-consistent region
+   non-empty) is evidence no single wrong claim can fake -- two
+   independently-wrong latches rarely agree with each other and with the
+   receiver's support at once. Fusing only consensus PAIRS (a 2D fix, not
+   a circle), or injecting consensus-pair hypotheses at bounded mass
+   instead of reweighting, is the first candidate for making fusion pay.
+   The RL stage then has a real job on a safe substrate: warm-start the
+   clone onto this stack, supervise the head toward the honest beacon,
+   and let the belief-error sender credit price every broadcast by its
+   measured effect on receivers' errors.
+
+### Where this leaves the goal
+
+Stage A is done and its gate met half-way: the frozen protocol recovered
+about half of D's loss (0.555 -> 0.591) but fusion itself is still
+net-negative -- so the next run must NOT be a 7-hour RL fine-tune on the
+A2 stack. The measured order: build the consensus-pair fusion
+(two-ring agreement gate, distinct senders, both-consistent acceptance;
+unit-test it against a wrong-latched clique), re-probe on the clone for
+>0.691 or at least parity, and only then fine-tune with RL against the
+A7 baseline (0.691 / 0.310). B' (0.677 / 0.331) remains the RL ceiling to
+beat on speed; A7 now beats it on accuracy and from tick 5000 on.
+
+Suite: 314 passed (11 new: innovation-gate reject/pass, tc-peer-zero
+peer/wall-seed rows and off-control, arrival-gate persistence/anchoring/
+reset/passthrough, arrived-only beacon write blocked/anchored/off-control).
+
+## 2026-10-12/13 (phase 170): the noise floor, the wrong-stop decomposition, four protocol variants measured out, and the learned transmission pair -- the position-claim channel closes, symmetrically, on both sides
+
+Stage B of the transmission plan, run over two days with the stage-A
+protections frozen as the substrate. Five threads, each with a measured
+verdict; the chapter ends with the channel measured out on every route --
+fixed sender, fixed receiver, learned sender, learned receiver -- and the
+frozen clone + protection stack (A7) still the best artifact in the project.
+
+### The harness grew instruments, and one of its own flags was a no-op
+
+- `--filter-seed` (the noise-floor probe, built in phase 169) had **never
+  actually worked**: it reseeded the global torch RNG, but every belief.py
+  draw passes `generator=trainer.sample_rng` -- a Generator seeded once from
+  `cfg.seed` in `_init_globals`. The first two "replicate" runs reproduced
+  A7 bit-identically. Fixed to reseed `trainer.sample_rng` too; the TRUE
+  filter-noise floor is then **+-0.02-0.035 settled across filter seeds**,
+  plus **+-0.02 across arena sequences** (`--swarm-rng`): total ~+-0.03 on
+  the 4-arena harness. Every delta smaller than that is noise; several
+  earlier single-cell comparisons (P1 vs A7 among them) were inside it.
+- `_final_state` now records `believed_dist` (the filter's own mean to the
+  robot's ASSIGNED target) and `believed_conf` per robot -- the latch
+  decision's inputs, comparable with truth after the run. This is the
+  instrument that decomposed the wrong stops (below).
+- A canonical launcher, `scripts/eval_paired.sh`, encodes the A7 recipe so
+  no one re-derives it (an earlier one-off shell error cost an eval round:
+  "--swarm-rng: command not found").
+
+### The wrong-stop decomposition: gate geometry is NOT the cause
+
+Of A7's 51 wrong-stopped robots: 55% sat in the 5-8u band between the gate
+radius (0.08) and the settle tolerance (0.05) -- so the first probe
+tightened the gate. **Refuted, monotonically**: gate 0.06 and 0.05 scored
+0.610 and 0.536 (vs A7's 0.691), and the wrong-stop mass did not shrink, it
+MIGRATED into the 8-20u band (13 -> 33 robots at gate 0.05; wrong median
+6.7 -> 8.8u). Mechanism: the filter's believed distance UNDER-REPORTS while
+moving, so a tighter gate means more overshoot before the latch; the 0.08
+gate was absorbing filter lag, not causing wrong stops. The believed-vs-true
+readout then split the 51 into: **bucket A (41%)** -- confidently wrong
+(conf >= 0.4, believed < 8u, true ~5.9u): genuine filter-mean error;
+**bucket B (59%)** -- stale latches (final conf median 0.20 vs 0.80 for
+settled-right; some believed 16-35u away): parked on a latch their own
+current belief would refuse. The AND-gate arm (closed form AND learned head)
+is dead: it stops 0.474 of robots (moving 0.503) -- the learned head almost
+never co-fires with the closed form.
+
+### Release hysteresis: three designs, three measured negatives, thread closed
+
+Bucket B motivated a release path for the terminal latch. v1 (stay off while
+the closed form holds) **churned 55,890 release decisions in one episode and
+lost 0.16 settled** -- settled robots' conf dips below the 0.4 gate floor
+often enough that plain re-testing wakes them (29 previously-settled robots
+disturbed per 12 wrong stops fixed), and a released robot cannot re-reach
+the parked-robot latch floor while moving: a poverty trap (moving 0.043 ->
+0.262). The KILOBOT_RELEASE_DEBUG probe also measured the learned arrived
+head **saturating at p=1.000 on 786/786 already-off evaluations** -- it keys
+on the parked observation itself, so it is a slave to the latch and can
+never vote to release. v3 (strong repudiation only: conf < 0.15 AND
+believed dist > 0.12) cut the churn 3x and still lost (0.579 vs 0.691;
+moving 0.139, woken robots wandering at 18.5u median, unable to re-latch).
+**Terminality is load-bearing**: the latch economy cannot afford release
+because re-localization while moving is the binding weakness. The flag
+(`closed_form_release`, default off) and its 6 tests stay as the
+documentation of the negative.
+
+### Sender-pool measurements: the honest protocol is starved by geometry, not by thresholds
+
+- `PEER_CONF_MIN` (0.85) is now configurable (`set_peer_conf_min`,
+  `KILOBOT_PEER_CONF_MIN`): the honest beacon's conf has **median 0.80** for
+  settled robots, so the 0.85 gate filtered out most of the honest sender
+  pool -- the peer-fix probe's 96%-zero usable histogram was a threshold
+  mismatch. But widening it (0.70, 0.60) **changed nothing**: the conf
+  distribution is bimodal (parked robots sit at ~0.8+ or ~0.0-0.3), and
+  senders cluster at the shape while receivers in need are mid-arena, 7u IR
+  cannot bridge it.
+- `beacon_anchored_min_conf` (mid-arena senders: anchored + conf >= bar
+  broadcasts instead of arrived-only): conf 0.6/0.7 slightly harmful
+  (0.676 vs 0.691), conf 0.8 statistically A7 (0.695; too few extra
+  senders to matter). The fixed-protocol sender space is measured out.
+
+### The hop-count protocol: the position-free redesign, measured strongly negative
+
+The one protocol immune to sender-mean error: robots maintain their
+communication-graph distance in IR hops to each corner seed
+(`observation.hop_flood_update`, min-relaxation over received message slots
+0-3, direct seed sighting = hop 0; `belief.add_hop_bounds` fuses the counts
+as SOFT UPPER BOUNDS -- euclidean dist <= k * IR range -- whose
+intersection prunes the cloud). Unit-tested both sides. Measured on the
+paired harness: **0.337 vs A7's 0.691, wrong stops 0.631, wrong median
+11.1u** -- worse than any position-claim variant. Mechanism: a soft upper
+bound gives every particle inside the box ~equal weight, so the cloud
+relocates toward the box intersection, tightens (conf rises), and the gate
+closes on a confidently-wrong mean -- the same conf-inflation signature,
+manufactured without any position claim. And by the time the flood
+converges to tight bounds, robots are already near the shape: the
+information is only available where it is no longer needed. A prune-only
+variant (never reweight toward boxes) remains untested and is the only
+version with a theoretical case left; the tight-bounds-arrive-late finding
+caps its upside.
+
+### The Stage 3 pair: the learned sender, trained on the protected substrate -- and the infrastructure lesson
+
+`scripts/train_rl_s3_seq.sh` runs the learned-transmission arm and the
+never-run no-comms control (both from the clone, identical recipes,
+100 iters, 4 workers, the A7 protections + tc-peer-zero live during
+training for the first time). **Infrastructure, learned the hard way and
+now part of the handoff**: three consecutive full-system crashes were
+traced (systemd journal, `app-org.kde.konsole-98395.scope`) to the training
+running inside the terminal's own cgroup -- 16 Unity players + 2 CUDA
+learners ballooned that one scope to 21.8G memory peak + 21.5G swap peak on
+a 30G box (zram swap is RAM; it relieves nothing). setsid does not escape a
+cgroup. The durable fix: run training as a **systemd --user unit**
+(`systemd-run --user --unit=... -p MemoryMax=16G`, linger enabled), with
+the env's python named explicitly (the user manager has no conda
+activation) and the conda-env import bug the first relaunch hit. Sequential
+arms, not concurrent: one arm is ~15-17G (the learner alone is 7-8.6G --
+allocator high-water, not live data; `MALLOC_ARENA_MAX=2` +
+`MALLOC_TRIM_THRESHOLD_` added), two concurrent arms crashed the session.
+
+Results (paired harness, fs7+fs1 means; A7 = 0.671 +- 0.015, t4k 0.304):
+
+| arm | channel OFF | channel ON (learned beacons) |
+|---|---|---|
+| comms arm | 0.637 (t4k 0.304, wrong 0.329) | **0.510** (wrong 0.484) |
+| control arm (no channel ever) | 0.628 | -- |
+| recv arm (below) | 0.627 | 0.518 (gate) / 0.520 (forced open) |
+
+1. The learned channel is **strongly net-negative, replicated across two
+   independently trained actors and three eval cells** (0.510/0.518/0.520;
+   wrong stops ~0.46-0.50 vs ~0.33). Phase 168's C' reproduces on the
+   corrected substrate WITH the supervision anchor and honesty penalty
+   live: PPO, given a fixed position-claim receiver, converges to
+   broadcasting claims that manufacture premature confident stops.
+2. The control-vs-comms "supervision anchor stabilizes the trunk"
+   hypothesis from the fs7 single cells **washed out** in the replicates
+   (0.628 vs 0.637 = +0.009, inside noise).
+3. Both fine-tunes land ~0.63-0.64, i.e. ~0.03-0.04 BELOW A7, the same
+   direction twice: on the protected substrate the RL fine-tune **adds
+   nothing** -- the protections already banked the clone's available gain,
+   and gradient updates only spend it. Speed parity at best (t4k 0.304 vs
+   A7's 0.304).
+
+### The learned receiver: built, trained, and pinned at its initialization
+
+The last untried branch. The policy's own message **slot 3** (free real
+estate: the beacon writes 0-2, supervision targets 0-2) is the robot's
+receiver-trust output: post-squash [-1,1] -> g = 0.5*(v+1) in [0,1], stored
+per-robot between decisions, scaling next tick's fused-ring sigma by 1/g
+(`belief.add_peer_range(..., peer_trust)`; g=1 reproduces the ungated
+receiver exactly -- unit-tested -- and the knob's dynamic range is [0.5, 1],
+below which rings are fully defused). Readout init plants the gate at
+g ~ 0.98 via `head_msg.bias[3] = 2.0`, so training starts at the status-quo
+receiver. Trained 100 iters (comms recipe + `KILOBOT_RECV_GATE=1`,
+`scripts/train_rl_recv.sh`, with one mid-run pause/resume through
+`KILOBOT_RESUME` -- the checkpoint carries the optimizers and the iteration
+counter, and the resumed run's first line printed EV 0.78, confirming
+state restoration). **The gate never moved**: slot-3 bias across
+checkpoints 2.0003 / 2.0007 / 2.0008 / 2.0001 / 2.0002 at iters
+10/30/50/60/90 -- pure PPO noise around initialization, ~370k decisions,
+no directional drift in either direction; the eval pair differs by 0.002
+between gate live and forced open. The receiver-side learning problem is
+HARDER than the sender-side (whose output enters many receivers' filters;
+the gate's output enters only its own, one tick delayed, through a sigma
+scaling): at the substrate-required actor LR there is no exploitable
+gradient.
+
+### Where this leaves the goal
+
+The position-claim transmission channel is **measured out on every route**:
+four fixed sender protocols (honest beacons, sender gates, consensus LSQ,
+threshold-tuned receivers), one position-free redesign (hop-counts), one
+learned sender, one learned receiver -- all net-negative, starved, or
+inert, with the same mechanism each time: a spread cloud cannot locally
+verify a claim, so fusion trades variance for bias; accurate senders are
+geometrically unreachable; learning can only modulate the poison, and PPO
+chooses to inject it because confidence inflation pays the stop bonus in
+training. The negative is well-controlled (paired harness, measured noise
+floor, replicates, mechanism attribution at each failure) and stands as a
+result. The best artifact remains **A7: the frozen BC clone + the
+protection stack (arrival-persist + min-anchored, arrived-only beacons,
+tc-peer-zero, closed-form hybrid gate), 0.671 +- 0.015 / t4k 0.304** --
+which also beats the clone on BOTH metrics with the channel fully inert.
+
+Open directions, in the order the measurements suggest: (a) write the
+chapter up as a controlled negative and ship A7; (b) attack bucket A
+(~0.11 of robots, confidently-wrong filter means) at the FILTER -- the
+cheap variants (more particles: measured flat; thresholds: measured
+refuted) are done, so this means structural filter work; (c) an
+interface-level redesign of what fusion consumes (not position claims --
+e.g. relative/bearing quantities or task-directed content), which changes
+message semantics within the 9-float interface and needs explicit
+sign-off.
+
+Suite: 342 tests collected (20 new since phase 169: closed-form-release semantics
+x6, peer-conf gate x3, hop flood + bounds x7, recv-gate x4, plus the
+launch-field declaration guard and the eval plumbing tests).
+
+## Handover: state of play as of 2026-10-13
+
+### The objective, stated once, precisely
+
+For each robot: did it **stop**, and is it **within 5u of the point
+`observation.ensure_target` gave it**. Reported on the paired harness
+(4 arenas / 8000 ticks, `--swarm-rng 500 --seed 7`, per-cell filter-seed
+noise floor ~+-0.03 -- run any claim on >= 2 filter seeds or 2 arena
+sequences). `scripts/eval_paired.sh OUT.json [extra flags]` encodes the
+standard recipe. Coverage is NOT the objective (0.286 chance floor).
+
+### Where the numbers stand (all 2-cell means unless noted)
+
+| driver | settled<5u @t8k | t4k | stopped-wrong |
+|---|---|---|---|
+| **A7: frozen BC clone (`bc_v2/run_r0`) + protection stack** | **0.671 +- 0.015** | 0.304 | 0.292 |
+| BC clone alone | 0.631 | 0.285 | 0.325 |
+| S3 comms arm, channel off | 0.637 | 0.304 | 0.329 |
+| S3 control arm | 0.628 | 0.280 | 0.324 |
+| S3 recv arm, channel off | 0.627 | 0.287 | 0.337 |
+| any arm, learned channel ON | 0.510-0.520 | 0.24 | 0.46-0.50 |
+| hop-count protocol | 0.337 | 0.19 | 0.63 |
+
+The wrong-stop budget (A7, 0.273): bucket A ~41% confidently-wrong filter
+means (true ~5.9u); bucket B ~59% stale terminal latches (final conf
+median 0.20). Bucket B cannot be released (three measured negative release
+designs); bucket A is a filter problem.
+
+### What is measured OUT -- do not re-try without a new mechanism
+
+- **The position-claim transmission channel, every route**: fixed honest
+  beacons (argmax fusion), sender-gate variants (arrived-only, anchored +
+  conf thresholds), consensus-pair LSQ (starved: 96% of receiver updates
+  see zero usable peers), threshold-tuned receiver gates (conf is
+  bimodal; geometry, not thresholds, starves the channel), the learned
+  sender (strongly net-negative, replicated across 2 actors), the learned
+  receiver (no gradient: gate pinned at init across 370k decisions).
+  Mechanism, measured at each failure: a spread cloud cannot locally
+  verify a claim; fusion trades variance for bias; accurate senders are
+  geometrically unreachable (parked at the shape, IR 7u); learning can
+  only modulate the poison and PPO chooses to inject it (confidence
+  inflation pays the stop bonus in training).
+- **The hop-count protocol as soft bounds** (0.337, mechanism: box
+  interiors give equal weight, cloud relocates and tightens). Prune-only
+  variant untested -- the only survivor of this family with a case.
+- **Release from the terminal latch** (three designs: plain re-test,
+  hysteresis, strong repudiation -- all net-negative; the learned arrived
+  head saturates at p=1.0 when parked, measured 786/786).
+- **The arrival-gate radius** (tightening 0.08 -> 0.05 monotonically
+  WORSE: the filter under-reports distance while moving; the gate absorbs
+  filter lag).
+- **RL fine-tuning on the protected substrate** (two arms: -0.03 to -0.04
+  vs A7, same direction twice; the protections already banked the
+  clone's available gain).
+- Older, still standing: more particles for the filter (32-128 measured
+  flat on solo collapse), BPTT for this task's horizon (credit_probe),
+  the DeepSet aggregator (decisive experiment), RL from scratch
+  (exploration/local-optimum).
+
+### What to reuse
+
+- **The artifact**: `results/bc_v2/run_r0/actor_best.pt` + the A7 eval
+  stack, which is the base recipe inside `scripts/eval_paired.sh`.
+- **Checkpoints**: `results/rl_s3/{comms,control,recv}/tb/*/` --
+  `ckpt.pt` every 10 iters (policy+critic+optimizers+iteration counter;
+  `KILOBOT_RESUME=<path>` resumes exactly, verified), `actor_final.pt`
+  exported at 100.
+- **Recipes**: `scripts/train_rl_s3_seq.sh` (sequential pair),
+  `scripts/train_rl_recv.sh` (learned receiver),
+  `scripts/train_rl_transmission.sh` (the v5 single-arm recipe).
+- **Eval tooling**: `tools/eval_closed_loop.py` now records per-robot
+  `believed_dist`/`believed_conf` in the final snapshot (the wrong-stop
+  attribution instrument) and honors `--filter-seed` correctly (it must
+  reseed `trainer.sample_rng` -- the global torch seed is not what the
+  filter draws from).
+- **The analysis one-liners**: settled/wrong/moving from the final JSON
+  via per-robot `pos`/`target`/`stopped_flags` (dist = euclidean in RAW
+  arena units; settled = <= 5.0).
+
+### Infrastructure facts a future agent will otherwise re-learn painfully
+
+- Run training as a **systemd --user unit**
+  (`systemd-run --user --unit=<name> -p MemoryMax=16G`), never from a
+  terminal: a full pair once ran inside Konsole's cgroup and peaked at
+  21.8G memory + 21.5G swap, crashing the session and every child
+  (setsid does NOT escape a cgroup). Linger is enabled
+  (`loginctl enable-linger`), so user units survive logouts.
+- One arm at a time: learner ~7-8.6G host RSS (allocator high-water, not
+  live data) + 4 workers x ~1.1-1.7G + desktop ~10G. Concurrent arms
+  crash the box. Worker RSS grows ~0.5G per 50 iterations (slow leak,
+  uninvestigated) -- `MemoryMax` bounds the blast radius.
+- The systemd environment has no conda activation: name
+  `/home/moshe/miniconda3/envs/kilobot-gnn/bin/python` explicitly.
+- Background work must be launched from a SCRIPT FILE with `nohup ... &`
+  inside (an inline `nohup ... &` in a tool call that times out gets
+  killed with the call's process group -- this killed one eval mid-run).
+- Eval cells run ~12-15 min solo, ~35-40 min at 4-way parallelism
+  (8000 ticks). Training: ~3.2 min/iter at 4 workers (~5.4h per 100).
+
+### Constraint the user has set (updated 2026-10-13)
+
+No new sensors, scenario bounds, or oracle changes without explicit
+approval. Changes INSIDE the current interfaces are allowed and were used
+heavily: gate/latch machinery, reward terms, filter/fusion machinery,
+message-slot semantics (slots 0-2 beacon, 3 receiver gate / hop counts),
+eval-tool instrumentation. The message interface is 9 content floats +
+strength; changing WHAT fusion consumes (not position claims) is an
+interface-level redesign and needs sign-off.
+
+### Recommended next step
+
+Ship the negative: the transmission chapter is complete and controlled.
+The one live accuracy lever is **bucket A** (~0.11 of robots, filter mean
+~6u wrong while confident) -- structural filter work (the thresholds,
+particle counts, and release paths are all measured out), or an
+interface-level redesign of the channel per (c) above if the comms story
+must be revived. Select any future change on the paired harness with >= 2
+filter seeds against the A7 mean; never on single cells.
+
+## 2026-10-13 (phase 171): the evidence-sharing redesign -- two kill-gates passed, the channel re-implemented
+
+The user restated the goal: get the swarm communicating so robots localize
+QUICKER by sharing what they find, and show RL useful at this scale against a
+typical state machine. The diagnosis that reframed everything: the position-
+claim channel never had a chance to work, for two measured reasons -- the
+graph is BORN DISCONNECTED under scatter spawn (lambda ~ 0.2 neighbors, ~80%
+of robots have none; peers also compete with 108 seed broadcasts in the
+strength-weighted event pool), and the arrived-only sender pool is temporally
+inverted (senders start talking at median tick ~4082, receivers localize at
+~2040). Packing the spawn was rejected by the owner (it confounds the swarm
+benefit with prior alignment); density increases were rejected on arithmetic
+(consensus-viable lambda needs ~20-30x the population -- infeasible and task-
+destroying). The scatter-native route instead: share EVIDENCE, not
+conclusions.
+
+### Gate 1 (encounter flux, measured): the window overlap exists when senders may talk mid-arena
+
+New instrument (`--encounter-probe`, config.encounter_probe, eval-tooling
+only): per decision tick, count receptions from evidence holders (beacon
+content conf >= 0.6/0.7/0.8) split into the receiver's lost phase (own conf
+< 0.4). Two cells on the exact A7 recipe (innovation-min 1.1, fusion inert,
+behavior-neutral by construction -- both cells scored 0.6915 settled,
+identical):
+
+| pool | hit >=1 usable while lost | >=2 (consensus-capable) | first usable tick | localized robots helped BEFORE localizing |
+|---|---|---|---|---|
+| arrived-only (status quo) | 36/187 (19.3%) | 36 (19.3%) | median 4082 (AFTER localization median 2040) | 1/146 (0.7%) |
+| anchored + conf>=0.7 | 107/187 (57.2%) | 106 (56.7%) | median 2022 (just before) | 50/146 (34.2%) |
+
+The phase-170 starvation statistic is thus fully attributed: it was the
+SENDER POOL, not the geometry alone. (Single filter seed fs7; the A-vs-B
+contrast is far outside the +-0.03 noise floor but T1 claims run >= 2 seeds.)
+
+### Gate 2 (homing mechanism, measured): given contact, conversion is near-deterministic
+
+`tools/homing_probe.py`: standalone sim, exact project kinematics
+(split_tick_motion's polygon) and strength law; a receiver with no bearing
+sensor (one scalar per reception, odometry between receptions, receptions
+only within 7u and with probability p). Verdict: the law that INVERTS the
+strength law for the beacon position (Gauss-Newton over receptions spanning
+passes) converts first contact to arrival 100% of the time at every distance
+(20-80u), both p=1.0 and p=0.3, robust to 0.003 rad/decision heading drift;
+median ~22-31 decisions (~2 sim-seconds). Overall success is first-contact-
+limited (17-41%) -- exactly Gate 1's flux, multiplying a ~100% conversion.
+Bang-bang chemotaxis manages only 9-22% conditional: the ESTIMATOR matters,
+which argues for letting RL learn the policy rather than scripting a crude
+law. Two implementation lessons recorded: the first-pass geometry is
+tangential ~half the time, so a decline-reorientation with refractory and an
+out-of-range grace-then-reverse are load-bearing; and the odometry track must
+rotate each interval's local motion by accumulated heading
+(split_track_update semantics) or the estimator's frame shears.
+
+### The redesign (implemented this phase; owner-approved interface change)
+
+New module `python/evidence.py`; wire format UNCHANGED (9 floats + senderId
++ strength; no Unity rebuild); tc-peer-zero stays ON in every arm (the motor
+trunk never sees peer content); A7 protections untouched.
+
+- Slot semantics: 0-2 honest beacon (unchanged content) under the
+  anchored-conf sender gate (`evidence_beacon_conf` 0.7 -- Gate 1's pool);
+  3-5 DISCLOSURE = the sender's last DIRECT sighting (landmark id
+  (k+1)/10, k in 0-3 corners / 4-7 wall sides; measured range / 2*ARENA_HALF;
+  recency decaying over `disclosure_recency_ticks` in the RECEIVER's clock
+  combined with the sender's encoded age) -- a raw measurement record, not a
+  posterior; eligibility is the sighting's freshness, not the beacon's conf
+  bar. Slot 6 = the learned broadcast VETO (T2, `learned_veto`): the policy
+  can only silence its row, never lie louder. 7-8 reserved, zeroed.
+- Receiver: the CLAIM STORE (`claim_store`, per sender, capacity 8, oldest
+  evicted) retains beacons across encounters, propagates each claim's ring
+  through the receiver's own odometry (per-claim dx/dy/heading track,
+  split_track_update semantics, NORMALIZED at the boundary -- raw
+  split_tick_motion units divided by ARENA_HALF exactly as belief_predict
+  does), and ages sigma through conf (rate*path under the 0.02 variance
+  convention). Consumption REPLACES single-ring argmax fusion: the
+  materialized store feeds belief.add_peer_fix, whose existing gates ARE the
+  consensus semantics (pair separation cap, >=3 residual, spread floor,
+  cooldown, bounded-mass injection for spread clouds only). A claim is never
+  fused alone.
+- Homing: `referral_store` + `select_referral` (freshest effective recency,
+  then smallest landmark range -- a sender that was AT the landmark); the
+  homing controller tracks the target sender's signal stream and inverts the
+  strength law for its position (Gate 2's estimator). `referral_homing`
+  (T1b) replaces the policy's motors ONLY for lost robots (conf < 0.4, the
+  arrival gate's own bar) with a trustworthy fit (rms < 0.02); steering
+  signs pinned by test against the oracle's TURN_MOTOR convention.
+  `homing_proprio` (T2) appends the +3 readout (distance, sin, cos -- the
+  nearest-seed trio's convention) to the actor's proprioception; input width
+  changes, so BC tapes must record these columns dark (HOMING_PROP_SIZE in
+  kilobot_gnn.py; warm-start loader tolerance still TODO for T2).
+- Retired under evidence_comms (code kept, slot usage freed): hop_comms
+  (0.337), claim_broadcast slots 3-7, recv_gate slot 3 (inert), single-ring
+  argmax fusion. Guarded at eval wiring: enabling both raises.
+- Reset hygiene: claim_store / referral_store / homing_state / last_sighting
+  joined trainer._reset_arena's pop list (the phase-168 leak family).
+
+Tests: 15 new in tests/test_evidence_comms.py (codec, store insert/dedupe/
+evict, propagation pinned against split_track_update, materialization +
+conf aging, consensus end-to-end through belief_update -- two agreeing
+claims inject, one does not, far-apart pairs refused -- sighting encoding,
+referral ranking/expiry, fit recovery from two chords, readout frame
+conventions, steering signs, override refusals). Suite: 357 passed. Smoke:
+T1a's tick-600 curve is IDENTICAL to the A7 baseline (consensus live, no
+behavioral disturbance); T1b runs clean with the homing perturbation
+visible. Gate-4 T1a cells (fs7+fs1) launched under systemd --user
+(gate4.service).
+
+### Next
+
+Gate 4 verdict on t1a (channel ON vs the Gate-1 OFF cells, >= 2 filter
+seeds); then T1b (referral_homing) cells; then Gate 3 (BC re-tape/re-fit
+with the +3 dark) and Gate 5 (T2 RL fine-tune, learned allocation,
+frozen-head ablation). The five-arm ladder and claims are as approved:
+T2 >> B0 is the headline; T2 > T1 is the learning attribution.
+
+## 2026-10-13 (phase 172): T1 verdicts -- consensus is a wash, homing-to-sender is refuted with a structural mechanism
+
+The Gate-4 cells on the frozen clone, paired harness (4 arenas / 8000 ticks,
+swarm-rng 500, seed 7; OFF baseline = the phase-171 cellB recipe, fusion
+inert, same writer pool):
+
+| arm | fs7 | fs1 | mean | delta vs OFF |
+|---|---|---|---|---|
+| cellB OFF (anchored-0.7 writers, fusion inert) | 0.6915 | 0.6671 | 0.6793 | -- |
+| T1a: + consensus claim store -> add_peer_fix | 0.6383 | 0.6649 | 0.6516 | -0.028 |
+| T1a-v2: + consensus pre-gate (both-ring agreement 0.10) | 0.6626 | 0.6649 | 0.6638 | **-0.016** |
+| T1b-iso: + homing override (naive law) | 0.1815 | (killed) | -- | **-0.51** |
+| T1b-iso2: + homing override (full probe law: decline reorientation, grace sweep-back, abandonment budget, degenerate-fit guard) | 0.1602 | (killed) | -- | **-0.53** |
+
+### T1a: the consensus path is a wash, not a win
+
+The first version (pre-gate absent) cost -0.053 at fs7: stored claims make
+poison PERSISTENT (a wrong claim heard once re-materializes every tick and
+re-injects after each cooldown, unlike the ephemeral rows the phase-170
+starvation protected us from). The pre-gate
+(evidence.consensus_filter: a claim survives only when a DISTINCT sender's
+ring agrees with it on the receiver's own cloud -- the fraction of particles
+within BOTH rings' 2-sigma bands >= 0.10) halved the harm. Mean -0.016 is
+inside the +-0.03 noise floor. What the pre-gate cannot fix: bucket-A
+wrong-latch senders broadcast conf~0.8 claims whose errors are CORRELATED
+(same filter mislocalization mechanisms), and the peer sigma floor (0.12 ->
+2-sigma bands of ~24 raw units) makes "agreement" cheap between claims ~20
+raw units apart. The remaining harm path is the phase-169 family: injected
+fix + the robot's own anchor -> the closed-form gate latches early/wrong.
+
+### T1b: homing-to-sender is refuted at pipeline scale -- senders do not stay at their evidence
+
+Gate 2 validated homing to a PARKED beacon at the evidence site. The
+pipeline's anchored-0.7 senders are NAVIGATING robots -- that is exactly why
+Gate 1's flux exists. A navigating sender's sighting is at a place the
+sender has LEFT by the time any receiver arrives: homing-to-sender chases a
+moving target away from its evidence. The naive port compounded this with a
+stale-fit capture (no abandonment), but the FULL probe law -- decline
+reorientation, grace sweep-back, 400-tick abandonment budget, degenerate-fit
+guard, all unit-tested -- scores the same catastrophe (0.1602). The capture
+cycle, not the law's details, is the mechanism: eligibility (conf < 0.4 +
+any fresh referral) captures up to half the swarm from tick 0, abandonment
+returns the robot to its policy, an immediate re-hearing re-captures it, and
+the cycle repeats every ~400 ticks -- so sustained wall-following, the only
+localization path, never happens. The coverage curve collapses BELOW the
+spawn floor within 2000 ticks (0.297 -> 0.113) and a third of the swarm
+never stops. The probe's premise (stationary beacon at the evidence) holds
+in-pipeline only for senders parked AT known landmark positions -- a tiny,
+transient population under scatter spawn.
+
+Verdict: both consumer mechanisms of the evidence-sharing redesign fail to
+beat the inert channel on the frozen clone. A7 remains the best artifact.
+The redesign's durable products are the instruments and the attribution:
+the encounter probe (the window-overlap measurement), the claim store +
+pre-gate (consensus machinery, unit-tested, currently a wash), and the
+homing controller's refutation-with-mechanism. The sender pool is the
+binding constraint: senders that are useful mid-arena (anchored, navigating)
+are exactly the senders whose evidence moves away from them.
+
+### The fork this leaves (owner decision)
+
+(a) Ship the negative: A7 + the instrumented attribution chapter (the
+channel closes a THIRD time, now with the window-overlap measurement and
+the capture-cycle mechanism). (b) One constrained variant remains with a
+theoretical case: homing restricted to senders whose CLAIMED position sits
+within ~2*IR of a KNOWN landmark position (verifiable from the corner table
+the receiver already holds), with a parked/stationary bit in slot 7 -- the
+only sender population whose evidence site does not move. Under scatter
+spawn that pool is sparse and transient (corner seeds are 4 points); Gate 1's
+flux numbers do not transfer to it, and it would need its own probe cell
+before any training.
+
+## 2026-10-14/15 (phase 173): the density ladder -- five densities, all paired deltas positive, growth with N everywhere except a single mid-row dip
+
+### The question and the cells
+
+Does the evidence channel's benefit grow with swarm density? The original
+handoff planned 60/120/240/600; the session added 400 at the owner's
+request (the 240-600 gap was unsampled; 700+ excluded on wall-clock). Five
+paired OFF/ON cells on the frozen BC clone (A7), paired harness as in
+phase 172: OFF = cellB recipe (anchored-0.7 writers, consumption inert,
+--belief-comms --beacon-anchored-min-conf 0.7 --peer-innovation-min 1.1);
+ON = --evidence-comms (claim store + consensus pre-gate 0.10). Same
+writer pool both arms so writer-side effects cancel. All cells share the
+ladder formation set (`results/ladder/val_formations_ge600`, 1902/2000
+drawings with >=600 on-pixels), ticks 8000, sample-every 200, encounter
+probe on, --filter-seed 7 --swarm-rng 500 --seed 7, one Unity instance;
+N fixed per cell. Arena counts: 4 at N=60/120, 2 at N=240/400/600
+(documented deviation, shared by both arms of a density).
+
+### The result (settled<5u at tick 8000, from the cell JSONs)
+
+| N (arenas) | lambda* | OFF | ON | delta | OFF probe share / hit | ON probe share / hit |
+|---|---|---|---|---|---|---|
+| 60 (4) | 0.23 | 0.6708 | 0.7042 | **+0.0334** | 0.026 / 61% | 0.026 / 62% |
+| 120 (4) | 0.46 | 0.6000 | 0.6396 | **+0.0396** | 0.074 / 80% | 0.067 / 79% |
+| 240 (2) | 0.92 | 0.5083 | 0.5229 | **+0.0146** | 0.143 / 92% | 0.134 / 91% |
+| 400 (2) | 1.54 | 0.4363 | 0.4813 | **+0.0450** | 0.200 / 95% | 0.202 / 96% |
+| 600 (2) | 2.31 | 0.3642 | 0.4225 | **+0.0583** | 0.286 / 99% | 0.262 / 98% |
+
+*lambda = N*pi*r^2/A with r=7u, A=40,000 u^2: 60->0.231, 120->0.462,
+240->0.923, 400->1.539, 600->2.309. Majority-consensus density (lambda>=2)
+is at N≈520, so the 600 row crosses it and the 400 row does not.
+(An earlier rough note printed 2.36 for the 600 row; 2.31 is the exact
+value. The handoff-era OFF240 figure 0.4771 is superseded: the cell's
+tick-8000 JSON says 0.5083, and that is what this table uses.)
+
+Probe = the encounter_report definition: share = median over robots of
+(lost-phase ticks with >=1 usable(0.7) reception)/(lost ticks); hit = % of
+ever-lost robots with >=1 such reception. Absolute settled falls with N
+(0.67 -> 0.36 on OFF) -- higher density is a harder task; only the paired
+delta carries the claim, and every one is positive.
+
+### Reading
+
+1. The delta GROWS with N: +0.033 -> +0.040 -> .. dip .. -> +0.045 ->
+   +0.058, with the 600 point the largest -- and 600 is the first cell
+   past the consensus threshold. No plateau, no negative at any density.
+2. The 240 row is a dip, not a refutation: both arms match the smooth
+   monotone OFF-trend (OFF: 0.67/0.60/0.51/0.44/0.36); it is the ON240 arm
+   that lands ~0.03 below the OFF-series interpolation (0.5229 vs a
+   ~0.55-0.56 trend value) while its probe flux matches OFF240's
+   (0.134 vs 0.143) -- a normal-looking resource with a sub-trend
+   consumption outcome, all under one seed (fs7). No error bars exist;
+   the dip is a cell-level fact, not a mechanistic conclusion.
+3. The probe flux itself is monotone with density on BOTH arms
+   (share 0.026 -> 0.074/0.067 -> 0.134/0.143 -> 0.200/0.202 ->
+   0.262/0.286). At N=600 the resource saturates in both arms (hit
+   >= 98%, shares ~0.26-0.29) while the settled delta is largest there --
+   the benefit at density is no longer about HEARING more; it is about
+   what the consumption layer does with what it hears. At 400 (the
+   not-yet-consensus point) the paired delta (+0.045) sits above the
+   120 point, consistent with density helping already before consensus.
+
+### Infrastructure this boot taught (recorded for the next run)
+
+- THEORY-CHECK (failed first, right second): the N=600 pair crashed at
+  reset twice ("Environment shut down with return code 0"). Root cause is
+  NOT a stale-port race: the player log (results/unity-logs/Player-0.log)
+  shows all 1200 agents spawn, then "GRPC Exception: ResourceExhausted,
+  Received message larger than max (5124165 vs. 4194304). Disconnecting
+  from trainer". mlagents_envs runs the grpc server python-side
+  (rpc_communicator.create_server) with the 4 MiB default receive limit;
+  Unity's client sends a ~5.1 MB first observation batch (~4.3 KB per
+  agent x 1200; the 480-agent 240-pair is ~2.0 MB) and is refused, then
+  exits 0. Anything >=~1000 agents per exchange hits this.
+- Fix (in-repo, not site-packages): python/unity_env.py's
+  `_widen_grpc_message_cap` wraps grpc.server before any worker is made
+  and passes max_send/max_receive_message_length = 64 MiB. Transport
+  only -- observation bytes are identical, cells of all densities stay
+  structurally comparable. The 361-test suite passes with it.
+- Runner hygiene that stuck: systemd --user units per script, 60 s sleep
+  between cells (harmless leftover of the wrong first theory), json
+  skip-guards for resume, and per-cell tick-8000 log lines as the
+  authoritative numbers (the JSON samples[-1] matches them exactly).
+
+### fs1 addendum (2026-10-15 evening): two-seed sweeps at 400 and 600
+
+The owner's higher-density mandate (skip repetition, add a (400, 800) point,
+focus on consensus densities) plus the same-content replicate run overnight as
+ladder6 (off first, 60 s gaps, same recipes, --filter-seed 1 only):
+
+| N (l) | OFF fs7 / fs1 | ON fs7 / fs1 | delta fs7 / fs1 | mean |
+|---|---|---|---|---|
+| 400 (1.54) | 0.4363 / 0.4437 | 0.4813 / 0.4375 | **+0.0450 / -0.0062** | +0.0194 |
+| 600 (2.31) | 0.3642 / 0.3733 | 0.4225 / 0.4175 | **+0.0583 / +0.0442** | **+0.051** |
+
+Probe shares at 400: 0.200/0.200 OFF, 0.202/0.206 ON, hits 95-96% both seeds;
+at 600: 0.286/0.274 OFF, 0.262/0.279 ON, hits 98-99% both seeds.
+
+Reading: the 240 fs7 dip and the 400 fs1 sign-flip are the same phenomenon:
+below the majority-consensus density the channel's NET benefit is inside the
++-0.03 seed noise under a fixed allocation, on all five cells' own evidence --
+absolutely no contradiction with the mechanism (receptions rise with density
+on EVERY arm; consumption is what flips). The two-seed-confirmed benefit
+lives in the consensus regime: at N=600 (lambda=2.31, ~110 robots ~majority
+available even as source-side peers) both independent task-draws agree the
+evidence channel pays ~+0.05 settled<5u while being done consuming the
+reception resource (shares 0.26-0.29, >=98% hit, both arms, both seeds).
+Consequence: T2's fine-tune trains at 600, not 400 -- confirmed signal is the
+required substrate, and N=400 is where a fixed allocator's score can go
+below 0 on a different task draw.
+
+### Decisions left open
+
+- fs1 replication of the 600 pair (and the fs1 spread over 60/120/240)
+  was deliberately traded away this session for the N=400 point (the
+  owner's "no repeats" call). It is the next session's first experiment
+  before any growth-with-N claim goes into the paper.
+- T2 (RL fine-tune, learned allocation on the fixed protocol) is now
+  plausibly justified at density per the original fork: the delta is
+  positive at every density and largest exactly where the resource
+  saturates. Gate it on the fs1 replicate of the 600 pair.
+
+These two are resolved by the fs1 addendum above: the 600 (+400) pairs
+replicated same-day, the below-consensus rows proved seed-noisy, and the
+fine-tune gate stands open for a launch at N=600. The full test suite
+(364, including the 3 new T2 warm-start/veto tests) passes with the
+grpc-cap fix and the T2 wiring in place (tests run post-ladder6).
+
+## 2026-10-16/18 (phase 174): T2's three recipes -- a catastrophe, two exact nulls, and the owner's stop -- plus the 800-pair that closes the density window
+
+### The five-arm table as measured (N=600, settled<5u at tick 8000, paired harness)
+
+| arm | fs7 | fs1 | verdict |
+|---|---|---|---|
+| B0 (no channel, cellB OFF) | 0.3642 | 0.3733 | the engineering baseline |
+| T1-fixed (evidence channel, thresholds) | 0.4225 | 0.4175 | **+0.058 / +0.044 -- the channel's real, two-seed-confirmed value** |
+| T2 v1 (whole actor trainable, 55 it) | 0.0617 | 0.0600 | **-0.36 catastrophe** (stopped 0.56 vs 0.97; probe share halved) |
+| T2a (motors frozen, veto-only, 55 it) | 0.4225 | 0.4175 | **bit-identical to T1-fixed, both seeds** -- the learned veto never fired |
+| t2ax (T2a + exploration: bias +0.5, entropy 3x, lr 2x, 120 it) | trained, artifact banked; **not eval'd** | -- | bias[6] moved 0.500 -> 0.504 over 65 exploration iterations: no gradient on the surface |
+| T2b (graded self-trust, slot 7) | machinery complete, untrained | -- | **owner-stopped before training** |
+
+### T2 v1: the catastrophe and its mechanism
+
+The first fine-tune (55 iterations x 256-tick rollouts, whole actor
+trainable) collapsed settled to 0.06 with stopped at 0.56 on BOTH seeds --
+the trained policy broke the swarm. Mechanism, measured: at 256-tick
+windows the reward never observes a settled outcome at N=600 (settled ~
+0.002 in every logged window; localization takes ~1500+ ticks), so PPO
+optimized only the belief-approach shaping and drifted the motor/arrival
+surface the BC clone owns. The training log's own signs: kl 3.9 -> 10.8
+early, motor std drifting 0.08 -> 0.11. The failure is structural to the
+recipe, not to the artifact: the freeze (T2a) removes exactly that degree
+of freedom and the collapse never recurs (kl pinned at 0.0025).
+
+### T2a: the freeze works as a control and the curation surface is empty
+
+With everything but head_msg excluded from the optimizer, 55 iterations of
+healthy training produced a policy whose deterministic eval is
+BIT-IDENTICAL to T1-fixed on both seeds -- every logged digit. The veto's
+bias never left +2.0 (its input weights moved; the mean never crossed
+zero anywhere the eval samples). The exploration variant (t2ax) then gave
+the veto every opportunity -- bias re-applied to +0.5 at resume (20%
+silence at iteration 0), entropy 3x, lr 2x, 65 more iterations -- and it
+moved 0.004 total. Conclusion: the binary veto has NO learnable gradient;
+silencing a row does not change any measurable return under this reward.
+The curation family's null is now three recipes deep.
+
+### T2b: the graded surface, implemented and stopped before training
+
+The slot-7 self-trust design (docs/t2b_design.md) was implemented and
+unit-tested (one-sided multiplier with a deadband: t >= -0.25 -> 1.0 --
+the deadband exists because the FIRST parity smoke caught the BC head's
+fit noise around zero (-0.004) demoting every claim by 0.4% and drifting
+the tick lines; t < -0.25 -> 1 + t; no amplification ever). Its parity
+smoke infrastructure (two N=60 full-length evals, metric-only diff) is in
+place. The owner stopped the program before its training run; the
+machinery is banked in the repo for whenever the question reopens.
+
+### The 800-pair: the density window closes
+
+| N (lambda) | OFF | ON | delta | probe share OFF/ON |
+|---|---|---|---|---|
+| 800 (3.08) | 0.3525 | 0.3644 | **+0.0119** | 0.366 / 0.331 |
+
+(lambda(800) = 800*pi*49/40000 = 3.08; an earlier note said 3.14 --
+corrected here.) The ladder now reads +0.033 -> +0.040 -> +0.015(dip) ->
++0.045(fs7; fs1 sign-flip) -> +0.051 two-seed mean -> +0.012. At 800 the
+reception resource is fully saturated (share ~0.35, hit ~99% both arms)
+and the extra density buys nothing the fixed thresholds can convert: the
+benefit is a DENSITY WINDOW -- it opens as the born-disconnected graph
+closes (lambda ~ 0.2-0.5), peaks in the consensus regime (lambda ~ 2.3),
+and decays above it as congestion and claim correlation dominate. The
+600-cells sit at the window's center, which is why they replicated. The
+800 row is single-seed: its +0.012 is positive but within +-0.03 of zero.
+
+### The conclusion about RL this program supports
+
+The owner's question -- "if these also fail, what is the conclusion about
+RL?" -- was asked before the stop, and the answer is on the record: across
+every scope tested (full fine-tune, frozen curation, exploration-room
+curation), no learned surface found gradient signal above the reward's
+noise at this scale. The channel's +0.05 at the window's center stands as
+ENGINEERING value (threshold design + the protection stack), and the
+learning attribution (T2 > T1) failed on all tested recipes. The
+measured reasons: the credit path is mediated and delayed (claims ->
+other robots' beliefs -> shared approach gradient, ~1200-robot dilution,
+~1500-tick delay against 256-tick windows); the channel's entire value is
+the same magnitude as the iteration-level belief-error noise band; and
+the poison the curation would need to remove (correlated confident-wrong
+claims) is structurally invisible to the sender -- a mislatched robot's
+own confidence says it is right. What remains live, each a new owner
+decision: the graded T2b surface (machinery banked), a sender-credit
+reward redesign (phase 164's rejected direction), long-horizon training
+at ~50 min/iteration, and the parked-bit probe (phase 172's fork (b),
+still gated on its own probe cell).
+
+### Infra facts this phase added to the hard-won list
+
+- The A7-recipe paired harness is BIT-REPRODUCIBLE end to end: the same
+  recipe run twice (the accidental v1 re-eval of 2026-10-18) produced
+  identical numbers -- worth having on record for the methods section.
+- Unit-name collisions block relaunches SILENTLY when the failed unit
+  stays loaded: systemd-run refuses, || true swallows it. Unique
+  unit names (timestamp suffixes) or reset-failed before every launch.
+- A killed eval's python outlives its Unity and holds the grpc port:
+  always pkill the python FIRST, then the player, then verify with ss.
+- The full test suite has a GPU-float flake
+  (test_record_snapshots_adds_conf_bonus..., a ~6e-6 residue on an
+  exactly-zero assertion): rerun before diagnosing.
+- The eval harness's tick lines carry a wall-clock suffix "(x.x min)":
+  any automated diff of two runs' logs must strip it.
+- launch.py's cfg-field test (the oracle_orbit_axis_trust_threshold
+  regression) caught veto_init the same way it was built to: wire the
+  env var, DECLARE the field.

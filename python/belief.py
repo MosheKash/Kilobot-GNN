@@ -117,6 +117,16 @@ TARGET_DIST_CLAMP = 3.0
 MEAS_SIGMA = 0.02
 PEER_SIGMA = 0.04
 PEER_CONF_MIN = 0.85
+# set_peer_conf_min(): runtime override of the receiver's usability gate.
+# Measured reason it must be configurable (the S1b diagnostic + the peer-fix
+# probe stats): the honest beacon's confidence (conf_pos * r) has median 0.80
+# for settled robots, so a 0.85 gate filters out most of the honest sender
+# pool -- 96% of receiver updates saw ZERO usable peers while ~96% of robots
+# were stopped and broadcasting. The fusion starvation was substantially a
+# threshold mismatch, not sender scarcity. Default stays 0.85 (bit-compatible).
+def set_peer_conf_min(v):
+    global PEER_CONF_MIN
+    PEER_CONF_MIN = float(v)
 LOCALIZED_CONF_THRESHOLD = 0.4  # conf_pos above this counts as "localized" for belief/frac_localized
 # Concentration (r, column 5 of belief_read) below which actor_io's steering
 # path stops trusting a fresh heading reading and falls back to the last one
@@ -127,6 +137,19 @@ LOCALIZED_CONF_THRESHOLD = 0.4  # conf_pos above this counts as "localized" for 
 HEADING_CONCENTRATION_MIN = 0.5
 PEER_SIGMA_FLOOR = 0.12
 PEER_SPREAD_FLOOR = 0.1
+# Peer-fix (phase 170): the multi-beacon position fix that replaces single-ring
+# reweighting. PEER_PAIR_MAX_SEP bounds the claims of the exactly-two-beacon
+# case: both senders are within IR_RANGE_NORM (~0.076) of the receiver, so two
+# honest claims sit at most ~0.15 plus their errors apart; beyond 0.30 at
+# least one claim is badly off and the fix is refused (the >= 3-beacon case is
+# instead vetted by its own LSQ residual, which an inconsistent set cannot
+# fake). PEER_FIX_JITTER is the hypothesis spread of injected fix particles,
+# sized to the claim errors the arrived-only protocol produces (up to the
+# 0.08 latch bar). PEER_FIX_STEP_MAX/ITERS bound the Gauss-Newton solver.
+PEER_PAIR_MAX_SEP = 0.30
+PEER_FIX_JITTER = 0.05
+PEER_FIX_ITERS = 5
+PEER_FIX_STEP_MAX = 0.25
 # Zero because KilobotMovement.cs no longer applies motor bias, noise or
 # smoothing -- that randomization was the only thing this modelled. Applies
 # unconditionally, unlike HEADING_NOISE_SCALE: position tracking runs for every
@@ -274,6 +297,54 @@ def _wall_along_log_w(p, along_axis, along_val, sigma, vis):
     return torch.where(vis.unsqueeze(1), -0.5 * err * err, torch.zeros_like(err))
 
 
+def _peer_fix_gauss_newton(q0, c, d, sig, valid):
+    """Batched least-squares position fix from range beacons.
+
+    q0 (n,2) is the start (the cloud's mean: the fix must be a hypothesis
+    NEAR where the robot plausibly is, so its own prior picks the branch).
+    c (n,K,2) claimed beacon centres, d (n,K) ranges from signal strength,
+    sig (n,K) per-ring measurement sigma, valid (n,K) usable mask. Gauss-Newton
+    on r_i(q) = |q - c_i| - d_i with weights 1/sig_i^2, closed-form 2x2 solve
+    with a ridge against collinear beacon sets and a step clamp against
+    divergence. Returns (q, resid_norm): resid_norm is the weighted RMS
+    residual in sigma units -- the over-determination consistency that
+    >= 3 honest beacons cannot fake and one badly-wrong claim cannot hide.
+    """
+    n = q0.shape[0]
+    q = q0.clone()
+    w_all = valid.float() / (sig * sig).clamp(min = 1e-6)
+    for _ in range(PEER_FIX_ITERS):
+        diff = q.unsqueeze(1) - c
+        dist = diff.norm(dim = 2).clamp(min = 1e-4)
+        r = (dist - d) * valid.float()
+        u = diff / dist.unsqueeze(2)
+        # JtWJ = sum_k w_k u_k u_k^T (symmetric 2x2), JtWr = -sum_k w_k r_k u_k.
+        # Every factor below is (n,K), so each sum collapses to (n,) -- the
+        # 2x2 system is solved in closed form per robot.
+        ux = u[:, :, 0]
+        uy = u[:, :, 1]
+        jt_wj_00 = (w_all * ux * ux).sum(dim = 1)
+        jt_wj_01 = (w_all * ux * uy).sum(dim = 1)
+        jt_wj_11 = (w_all * uy * uy).sum(dim = 1)
+        jt_wr_0 = -(w_all * r * ux).sum(dim = 1)
+        jt_wr_1 = -(w_all * r * uy).sum(dim = 1)
+        ridge = 1e-3 * (jt_wj_00 + jt_wj_11).clamp(min = 1e-6)
+        det = ((jt_wj_00 + ridge) * (jt_wj_11 + ridge) - jt_wj_01 * jt_wj_01).clamp(min = 1e-9)
+        dx = ((jt_wj_11 + ridge) * jt_wr_0 - jt_wj_01 * jt_wr_1) / det
+        dy = (-jt_wj_01 * jt_wr_0 + (jt_wj_00 + ridge) * jt_wr_1) / det
+        step = torch.stack([dx, dy], dim = 1)
+        step = step.clamp(-PEER_FIX_STEP_MAX, PEER_FIX_STEP_MAX)
+        q = q + step
+    diff = q.unsqueeze(1) - c
+    dist = diff.norm(dim = 2).clamp(min = 1e-4)
+    r = (dist - d) * valid.float()
+    # raw weighted-RMS residual, normalized by the valid beacons' mean sigma
+    # so the gate lives in "how many sigmas of inconsistency" units
+    resid_norm = torch.sqrt((w_all * r * r).sum(dim = 1) / w_all.sum(dim = 1).clamp(min = 1e-6))
+    resid_norm = resid_norm / ((sig * valid.float()).sum(dim = 1) / valid.float().sum(dim = 1).clamp(min = 1.0))
+    return q, resid_norm
+
+
 class _Update:
     """One belief_update in progress: the cloud, this tick's evidence, the result.
 
@@ -319,6 +390,7 @@ class _Update:
         self.sigma = MEAS_SIGMA + 0.15 * self.spread
         self.log_w = torch.zeros(self.n, self.k, device = p.device)
         self.any_meas = torch.zeros(self.n, dtype = torch.bool, device = p.device)
+        self.any_hop = torch.zeros(self.n, dtype = torch.bool, device = p.device)
         self.seed_meas = None       # any_meas as of before the peer/claim terms
         self.best_strength = torch.zeros(self.n, device = p.device)
         self.best_seed = torch.zeros(self.n, dtype = torch.long, device = p.device)
@@ -330,6 +402,7 @@ class _Update:
         self.w = None               # normalized particle weights, set by resample()
         self.best_raw_log_w = None  # raw fit quality, set by resample()
         self.cold = None            # robots the seed ring already re-seeded
+        self.peer_fix_injected = None  # robots the peer fix finally injected (set in add_peer_fix, refined in inject_peer_fix)
 
     # -- evidence ----------------------------------------------------------
 
@@ -347,6 +420,45 @@ class _Update:
             d_meas = _range_from_strength(strength)
             self.log_w = self.log_w + _range_log_w(self.p, self.seeds[s, 0].expand(self.n),
                                                    self.seeds[s, 1].expand(self.n), d_meas, self.sigma, vis)
+
+    def add_hop_bounds(self, hop_k):
+        """Soft upper-bound likelihoods from hop-count evidence (the robust
+        neighbour protocol -- see config.hop_comms).
+
+        A robot k communication-hops from seed s satisfies euclidean
+        dist(p, seed_s) <= k * IR_RANGE_NORM: each hop spans at most an IR
+        range, so hop distance is an upper bound on euclidean distance. The
+        intersection of a robot's hop-counts to the four corner seeds is a
+        prune box for the particle cloud -- exactly the robust, no-claims
+        information (unlike peer POSITION claims, which carry the sender's
+        mean error, hop counts are integer minima and self-correct under
+        min-relaxation) that mid-arena robots lack and the measured honest
+        protocol could not deliver.
+
+        The bound is soft (a smooth decay beyond the radius, not a cliff) so
+        seeds whose hop estimate ran stale lose nothing: the flood's
+        min-relaxation keeps k minimal, and a stale larger k is still a valid
+        (looser) upper bound. Deliberately does NOT touch any_meas / seed_meas
+        -- hops are inferential, not a direct sighting, so they can never mint
+        anchor confidence (the phase-168 poison).
+        """
+        if hop_k is None:
+            return
+        hk = hop_k.to(self.p.device)
+        for s in range(hk.shape[1]):
+            k = hk[:, s]
+            vis = k >= 0
+            if not bool(vis.any()):
+                continue
+            self.any_hop = self.any_hop | vis
+            radius = k.float() * IR_RANGE_NORM
+            sigma = IR_RANGE_NORM * (0.3 + 0.1 * k.float())
+            dx = self.p[:, :, 0] - self.seeds[s, 0]
+            dy = self.p[:, :, 1] - self.seeds[s, 1]
+            d_part = torch.sqrt(dx * dx + dy * dy)
+            excess = (d_part - radius.unsqueeze(1)) / sigma.unsqueeze(1)
+            lw = -torch.nn.functional.softplus(excess)
+            self.log_w = self.log_w + torch.where(vis.unsqueeze(1), lw, torch.zeros_like(lw))
 
     def add_wall_bands(self, wall_obs, wall_seed_xy):
         """A wall reading constrains the axis perpendicular to it, to a band."""
@@ -384,12 +496,24 @@ class _Update:
                 along_sigma = torch.sqrt(along_bound_sq).clamp(min = MEAS_SIGMA) + 0.15 * self.spread
                 self.log_w = self.log_w + _wall_along_log_w(self.p, along_axis, along_val, along_sigma, seed_vis)
 
-    def add_peer_range(self, peer_pos, peer_conf, peer_strength):
+    def add_peer_range(self, peer_pos, peer_conf, peer_strength, innovation_min = 0.0, peer_trust = None):
         """One peer beacon per update: the most confident valid sender.
 
         Only one, so a clique of correlated senders cannot multiply into a
         false sharp likelihood; and the sender's own positional sigma (decoded
         from its broadcast confidence) inflates the measurement noise.
+
+        innovation_min (cfg.peer_innovation_min): an innovation gate. The
+        chosen ring is fused only if at least this fraction of the receiver's
+        own particles lie within 2*sig_peer of it. A ring the whole cloud
+        disagrees with is either an overclaimed claim (the receiver-side
+        failure that cost the with-comms eval 0.13-0.19: the argmax fusion
+        picks the most confident row, so a liar always won the slot and its
+        ~50-unit-wrong ring dragged the mean every decision tick) or a rescue
+        case; fusing it anyway is a persistent bias the filter reads as fresh
+        independent evidence and cannot self-correct. Rejecting it costs
+        nothing the current code was doing right: a consistent ring passes
+        untouched, and a rejected ring is simply absent this tick.
         """
         self.seed_meas = self.any_meas.clone()   # everything so far came from map geometry, not peers
         if peer_pos is None:
@@ -403,11 +527,142 @@ class _Update:
         vis = usable[rows_idx, best]
         if not bool(vis.any()):
             return
-        self.any_meas = self.any_meas | vis
         d_meas = _range_from_strength(strength)
         sig_peer = self._sender_sigma(conf)
+        if peer_trust is not None:
+            # The learned receiver's trust gate (config.recv_gate): g in [0,1]
+            # scales the fused ring's sigma by 1/g. g=1 reproduces the
+            # ungated receiver exactly; g -> 0 defuses the ring (sigma ->
+            # huge, weight ~flat) without a hard accept/reject cliff -- the
+            # gate widens trust rather than binary-gating it, so the
+            # mean-bias harm mode shrinks smoothly. The gate is learned by
+            # PPO through the belief-error reward: fusing a claim that
+            # worsens the robot's own belief error costs advantage on the
+            # gate output itself. Capped so a near-zero gate cannot produce
+            # numerically silly sigma.
+            sig_peer = (sig_peer / peer_trust.clamp(min = 0.05)).clamp(max = 0.5)
+        if innovation_min > 0.0:
+            dx = self.p[:, :, 0] - peer_pos[rows_idx, best, 0].unsqueeze(1)
+            dy = self.p[:, :, 1] - peer_pos[rows_idx, best, 1].unsqueeze(1)
+            ring_resid = ((dx * dx + dy * dy).sqrt() - d_meas.unsqueeze(1)).abs()
+            in_band = ring_resid <= (2.0 * sig_peer).unsqueeze(1)
+            consistent = in_band.float().mean(dim = 1)
+            vis = vis & (consistent >= innovation_min)
+            if not bool(vis.any()):
+                return
+        self.any_meas = self.any_meas | vis
         self.log_w = self.log_w + _range_log_w(self.p, peer_pos[rows_idx, best, 0],
                                                peer_pos[rows_idx, best, 1], d_meas, sig_peer, vis)
+
+    def add_peer_fix(self, peer_pos, peer_conf, peer_strength, topk = 6, resid_max = 1.5,
+                     min_spread = 0.2, inject_ok = None):
+        """The multi-beacon position fix, in place of single-ring reweighting.
+
+        Why not reweighting: phase 169 measured single-ring fusion costing a
+        flat ~-0.10 settled regardless of per-ring consistency gating. Two
+        structural reasons. First, a spread cloud -- exactly the receiver a
+        beacon is meant to help -- covers ANY nearby ring band, true or false,
+        at the same ~0.6 fraction, so no first-order gate can vet one ring;
+        and the fused cloud collapses ONTO THE RING, whose point nearest the
+        old mean is arbitrary for a spread receiver. Second, a ~0.37 wrong-
+        claim rate among beacons (wrong-latched senders broadcast conf~1.0
+        claims indistinguishable from accurate ones) turns every fused ring
+        into a coin flip that pushes the mean somewhere on a circle.
+
+        The fix instead treats the usable beacons as ONE over-determined
+        measurement: a Gauss-Newton least-squares position fix over their
+        rings (initialised at the cloud's own mean, so the receiver's prior
+        picks the intersection branch). With >= 3 beacons the system is
+        over-determined and the weighted-RMS residual is a consistency test
+        an inconsistent set cannot pass -- one badly-wrong claim bends every
+        ring away from a common point. With exactly 2 beacons the residual is
+        vacuous (2 equations, 2 unknowns), so the pair is instead bounded by
+        the claimed-position separation (PEER_PAIR_MAX_SEP) -- two honest
+        senders are both within IR range of the receiver and cannot disagree
+        by more than that plus their errors.
+
+        The fix is consumed as a HYPOTHESIS, not a belief overwriter: it is
+        injected at bounded mass into the cloud's worst-weight half by
+        inject_peer_fix (below), never reweighted into log_w, and only for
+        receivers whose spread is past min_spread -- a structured cloud's own
+        seed/wall evidence is better than a neighbour's claim (phase 169's
+        A7-vs-A2 gap is exactly the harm of telling good receivers things
+        they already know more accurately). Injected mass then has to EARN
+        weight against the receiver's own evidence over the following ticks;
+        a wrong fix is pruned, a right one is confirmed. On a tick where the
+        receiver has no direct measurement, floor_peer_only_spread keeps the
+        spread above PEER_SPREAD_FLOOR, so conf cannot reach the arrival
+        gate's 0.4 bar on peer claims alone (only direct seed geometry mints
+        anchors) -- the channel cannot manufacture a stop by itself.
+
+        inject_ok (per-robot, from the caller's cooldown bookkeeping): a
+        fresh hypothesis at most once per cooldown window, so a persistent
+        pair cannot churn the cloud every decision -- the measured defect
+        that had oracle_arrived_claim_injection drop real arrivals 4/24 ->
+        1/24 before its cooldown existed.
+        """
+        self.seed_meas = self.any_meas.clone()   # everything so far came from map geometry, not peers
+        if peer_pos is None:
+            return
+        usable = (peer_strength > 0) & (peer_conf > PEER_CONF_MIN)
+        strength_top, idx_top = (peer_strength * usable.float()).topk(min(topk, peer_strength.shape[1]), dim = 1)
+        valid = strength_top > 0
+        if not bool(valid.any()):
+            return
+        n, k = self.n, self.k
+        c = torch.gather(peer_pos, 1, idx_top.unsqueeze(2).expand(n, idx_top.shape[1], 2))
+        conf_top = torch.gather(peer_conf, 1, idx_top)
+        d = _range_from_strength(strength_top)
+        # _sender_sigma is (n,)-shaped (one chosen peer per robot); the fix
+        # has K beacons per robot, so the same formula is expanded here with
+        # the spread broadcast per beacon column
+        sender_sig = torch.sqrt(-0.02 * torch.log(conf_top.clamp(min = 1e-3, max = 0.999)))
+        sig = (PEER_SIGMA + 2.0 * sender_sig + 0.15 * self.spread.unsqueeze(1)).clamp(min = PEER_SIGMA_FLOOR)
+
+        counts = valid.sum(dim = 1)
+        q0 = self.p[:, :, 0:2].mean(dim = 1)
+        q, resid_norm = _peer_fix_gauss_newton(q0, c, d, sig, valid)
+
+        gate = (counts >= 2) & (self.spread >= min_spread)
+        if inject_ok is not None:
+            gate = gate & inject_ok
+        # exactly 2 beacons: residual is vacuous, the separation cap does the vetting
+        pair_sep = (c[:, 0, :] - c[:, 1, :]).norm(dim = 1)
+        gate = gate & ((counts != 2) | (pair_sep <= PEER_PAIR_MAX_SEP))
+        # >= 3 beacons: the over-determination residual must pass
+        if resid_max > 0.0:
+            gate = gate & ((counts < 3) | (resid_norm <= resid_max))
+        if not bool(gate.any()):
+            return
+        self.any_meas = self.any_meas | gate
+        self.peer_fix_xy = q
+        self.peer_fix_injected = gate
+
+    def inject_peer_fix(self):
+        """Deliver the peer fix as bounded-mass hypotheses (see add_peer_fix).
+
+        Runs after seed/wall/arrived-claim injection so direct map evidence
+        keeps priority, and skips robots the seed ring already re-seeded this
+        tick. The injected particles sit AT the fix (+ jitter sized to the
+        claim errors), not on a ring: two rings intersect at a point, and a
+        point hypothesis is what a 2D fix means. Writes the final injected
+        mask back over peer_fix_injected so the caller's cooldown bookkeeping
+        stamps exactly the robots that were actually injected.
+        """
+        if self.peer_fix_injected is None or not bool(self.peer_fix_injected.any()):
+            return
+        where = self.peer_fix_injected & ~self.cold
+        if not bool(where.any()):
+            self.peer_fix_injected = where
+            return
+        n, k = self.n, self.k
+        jx = self.peer_fix_xy[:, 0].unsqueeze(1) + torch.randn(n, k, device = self.p.device,
+                                                               generator = self.generator) * PEER_FIX_JITTER
+        jy = self.peer_fix_xy[:, 1].unsqueeze(1) + torch.randn(n, k, device = self.p.device,
+                                                               generator = self.generator) * PEER_FIX_JITTER
+        pose = torch.stack([jx, jy, self._fresh_heading()], dim = 2)
+        self.out = self._mix_into_worst_half(pose, where.view(n, 1, 1))
+        self.peer_fix_injected = where
 
     def add_arrived_claim(self, pos, conf, valid, strength):
         """An arrived neighbour's claimed position: a range to a stopped robot.
@@ -432,7 +687,7 @@ class _Update:
         self.log_w = self.log_w + _range_log_w(self.p, pos[:, 0], pos[:, 1], self.d_meas_ac, sig_ac, valid)
 
     def has_measurement(self):
-        return bool(self.any_meas.any())
+        return bool((self.any_meas | self.any_hop).any())
 
     def _sender_sigma(self, conf):
         """Measurement noise for a range to a peer, inflated by its confidence."""
@@ -732,19 +987,34 @@ class _Update:
 def belief_update(p, seed_obs, generator, peer_pos = None, peer_conf = None, peer_strength = None,
                   wall_obs = None, fit_ema = None, anchor = None, wall_seed_xy = None,
                   arrived_claim_pos = None, arrived_claim_conf = None, arrived_claim_valid = None,
-                  arrived_claim_strength = None, heading_noise_scale = None):
+                  arrived_claim_strength = None, heading_noise_scale = None,
+                  peer_innovation_min = 0.0, peer_fix = False, peer_fix_topk = 6,
+                  peer_fix_resid_max = 1.5, peer_inject_min_spread = 0.2,
+                  peer_inject_ok = None, peer_injected = None, hop_k = None, peer_trust = None):
     """Fold one tick of measurements into the particle cloud.
 
     See _Update above for what each phase does and why the order matters.
     Returns the new cloud; p itself is never modified. anchor and fit_ema, when
-    given, are mutated in place.
+    given, are mutated in place; with peer_fix on, peer_injected (bool tensor)
+    is likewise -- the robots the peer fix actually injected, for the caller's
+    cooldown bookkeeping. hop_k ([n, SEED_SIZE] int, -1 unknown) applies the
+    soft upper-bound likelihoods of config.hop_comms' flood. peer_trust
+    ([n] float in [0,1], config.recv_gate's learned receiver) scales the
+    fused ring's sigma by 1/g.
     """
     generator = _matched_generator(generator, p.device)
     u = _Update(p, generator, heading_noise_scale)
     u.add_seed_ranges(seed_obs)
     u.add_wall_bands(wall_obs, wall_seed_xy)
-    u.add_peer_range(peer_pos, peer_conf, peer_strength)
+    if peer_fix:
+        u.add_peer_fix(peer_pos, peer_conf, peer_strength, topk = peer_fix_topk,
+                       resid_max = peer_fix_resid_max, min_spread = peer_inject_min_spread,
+                       inject_ok = peer_inject_ok)
+    else:
+        u.add_peer_range(peer_pos, peer_conf, peer_strength, innovation_min = peer_innovation_min,
+                         peer_trust = peer_trust)
     u.add_arrived_claim(arrived_claim_pos, arrived_claim_conf, arrived_claim_valid, arrived_claim_strength)
+    u.add_hop_bounds(hop_k)
     if not u.has_measurement():
         return p
 
@@ -752,8 +1022,13 @@ def belief_update(p, seed_obs, generator, peer_pos = None, peer_conf = None, pee
     u.inject_seed_ring()
     u.inject_arrived_claim_ring(arrived_claim_pos, arrived_claim_conf, arrived_claim_valid)
     u.inject_wall_band()
+    u.inject_peer_fix()
     u.floor_peer_only_spread()
     u.inject_random_particles(fit_ema)
+
+    if peer_injected is not None:
+        peer_injected |= (u.peer_fix_injected if u.peer_fix_injected is not None
+                          else torch.zeros_like(peer_injected))
 
     if anchor is not None:
         out, updated_anchor = belief_triangulate(u.out, anchor, u.best_seed, u.best_strength,

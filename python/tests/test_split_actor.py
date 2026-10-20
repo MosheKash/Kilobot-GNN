@@ -86,7 +86,7 @@ def test_split_actor_replay_consistent():
     assert torch.allclose(env_action, squash_action(u), atol=1e-6)
     assert env_action[:, MESSAGE_SIZE:].min() >= -1e-6
     assert env_action[:, MESSAGE_SIZE:].max() <= 1.0 + 1e-6
-    lp2, _ = policy.evaluate_batch_split(tc, prop, h, u)
+    lp2, _, _ = policy.evaluate_batch_split(tc, prop, h, u)
     assert torch.allclose(lp, lp2, atol=1e-5)
 
 

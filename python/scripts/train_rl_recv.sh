@@ -1,0 +1,87 @@
+#!/bin/bash
+# The learned-RECEIVER arm: the comms-arm recipe plus KILOBOT_RECV_GATE=1.
+# The message slot-3 gate starts at g~0.98 (status-quo receiver) via the
+# readout init and PPO learns whether to close it, priced by the robot's own
+# belief error. Comparison targets at completion (paired harness, 2 cells
+# each): recv-ON vs comms-arm-ON (0.510 mean) -- did the learned receiver
+# rescue the channel; recv-OFF vs comms-arm-OFF (0.637) -- did gate training
+# perturb the motor policy.
+# Usage: train_rl_recv.sh <iterations> <out_dir>
+set -o errexit
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PY_DIR="$(dirname "$SCRIPT_DIR")"
+REPO="$(dirname "$PY_DIR")"
+cd "$PY_DIR"
+
+ITERATIONS="${1:-100}"
+OUT="${2:-$REPO/results/rl_s3/recv}"
+mkdir -p "$OUT"
+
+# The systemd --user environment has no conda activation: name the env's
+# interpreter explicitly.
+PY=/home/moshe/miniconda3/envs/kilobot-gnn/bin/python
+export MALLOC_ARENA_MAX=2
+export MALLOC_TRIM_THRESHOLD_=134217728
+
+KILOBOT_INIT_ACTOR="$REPO/results/bc_v2/run_r0/actor_best.pt" \
+KILOBOT_MODE=rl \
+KILOBOT_SMOKE=0 \
+KILOBOT_ITERATIONS="$ITERATIONS" \
+KILOBOT_NUM_WORKERS=4 \
+KILOBOT_DEVICE=cuda \
+KILOBOT_ACTOR_TYPE=gru_split_observation \
+KILOBOT_SPLIT_ACTIVATION=elu \
+KILOBOT_USE_ARRIVED_HEAD=1 \
+KILOBOT_USE_TURN_ANCHOR=1 \
+KILOBOT_USE_STATE_HEAD=1 \
+KILOBOT_USE_WALL_HEAD=1 \
+KILOBOT_USE_ORACLE_HEAD=1 \
+KILOBOT_HEARTBEAT_TICKS=48 \
+KILOBOT_MIN_BOTS=40 \
+KILOBOT_MAX_BOTS=60 \
+KILOBOT_NUM_ARENAS=9 \
+KILOBOT_ROLLOUT_STEPS=1024 \
+KILOBOT_MAX_EPISODE_STEPS=8000 \
+KILOBOT_LOGDIR="$OUT/tb" \
+KILOBOT_UNITY_LOG_DIR="$OUT/unity-logs" \
+KILOBOT_SUMMARY="$OUT/live_summary.json" \
+KILOBOT_BASE_PORT=7300 \
+KILOBOT_REWARD_MODE=target \
+KILOBOT_TARGET_ACC_WEIGHT=1.0 \
+KILOBOT_TARGET_ACC_SIGMA=0.05 \
+KILOBOT_TARGET_TIME_COST=0.1 \
+KILOBOT_TARGET_SHAPING=5.0 \
+KILOBOT_STOP_BONUS=1.0 \
+KILOBOT_STOP_RADIUS=0.05 \
+KILOBOT_GLOBAL_SHAPING=2.0 \
+KILOBOT_BELIEF_SHAPING=2.0 \
+KILOBOT_SUCCESS_METRIC=settled \
+KILOBOT_SUCCESS_THRESHOLD=0.75 \
+KILOBOT_BELIEF_COMMS=1 \
+KILOBOT_BELIEF_COMMS_LEARNED=1 \
+KILOBOT_MSG_SUPERVISION=0.5 \
+KILOBOT_MSG_HEAD_PROP_INPUT=1 \
+KILOBOT_BEACON_HONESTY=4.0 \
+KILOBOT_CRITIC_BELIEF_FEATURES=1 \
+KILOBOT_RECV_GATE=1 \
+KILOBOT_QUIET_MSG_HEAD=1 \
+KILOBOT_MSG_LOG_STD=-2.5 \
+KILOBOT_MOTOR_LOG_STD=-2.5 \
+KILOBOT_LOG_STD_MIN=-4.0 \
+KILOBOT_MSG_LOG_STD_MAX=-2.5 \
+KILOBOT_USE_CLOSED_FORM_ARRIVED=1 \
+KILOBOT_CLOSED_FORM_HYBRID=1 \
+KILOBOT_CLOSED_FORM_ARRIVAL_DIST=0.08 \
+KILOBOT_ARRIVED_RELEASE_THRESHOLD=0.5 \
+KILOBOT_ARRIVED_FREEZE_HIDDEN=0 \
+KILOBOT_ARRIVAL_MIN_ANCHORED=1 \
+KILOBOT_ARRIVAL_PERSIST=2 \
+KILOBOT_TC_PEER_ZERO=1 \
+KILOBOT_ACTOR_LR=2e-5 \
+KILOBOT_PPO_EPOCHS=2 \
+KILOBOT_ENTROPY_COEF=0.001 \
+KILOBOT_ORACLE_KNOWN_START_HEADING=1 \
+KILOBOT_SWARM_RNG=500 \
+KILOBOT_FORMATIONS="$REPO/data/formations" \
+"$PY" -u launch.py > "$OUT/train.log" 2>&1
+echo "[$(date +%H:%M:%S)] recv arm finished (exit $?)"

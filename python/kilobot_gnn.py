@@ -290,6 +290,13 @@ SPLIT_ODOM_SIZE = 8 + BELIEF_FEATURES + BELIEF_TARGET_FEATURES
 # added at construction time instead, the same way use_arrived_head's extra
 # output head is.
 TURN_ANCHOR_SIZE = 2
+# T2's homing proprioception (config.homing_proprio): distance, sin, cos to
+# the fitted referral beacon -- the nearest-seed trio's exact convention.
+# Opt-in at construction like TURN_ANCHOR_SIZE; changes the first-layer input
+# width, so BC tapes for a homing_proprio warm start must record these
+# columns dark (zeros) and the warm-start loader must tolerate the width
+# change.
+HOMING_PROP_SIZE = 3
 SPLIT_UPSCALE_HIDDEN = 40
 # MUST stay in sync with config.py's split_gru_hidden. Two constants for one
 # concept: this is what SplitObservationActor() uses when constructed with no
@@ -406,7 +413,8 @@ class SplitObservationActor(nn.Module):
                  head_hidden = SPLIT_HEAD_HIDDEN, use_arrived_head = False, use_turn_anchor = False,
                  recurrent = True, activation = "relu", use_state_head = False,
                  use_wall_head = False, use_steer_feature = False, use_oracle_head = False,
-                 oracle_residual = 0.05, oracle_residual_turn = 0.0):
+                 oracle_residual = 0.05, oracle_residual_turn = 0.0,
+                 msg_head_prop_input = False, homing_proprio = False):
         super().__init__()
         # Kept under the name `relu` because split_forward_batch, every
         # checkpoint's key layout, and the ablation tooling all already refer to
@@ -416,7 +424,9 @@ class SplitObservationActor(nn.Module):
         self.activation_name = str(activation or "relu")
         self.relu = split_activation(self.activation_name)
         self.tanh = nn.Hardtanh()
-        up_in = SPLIT_TC_SIZE + SPLIT_ODOM_SIZE + (TURN_ANCHOR_SIZE if use_turn_anchor else 0)
+        up_in = (SPLIT_TC_SIZE + SPLIT_ODOM_SIZE
+                 + (TURN_ANCHOR_SIZE if use_turn_anchor else 0)
+                 + (HOMING_PROP_SIZE if homing_proprio else 0))
         self.up1 = nn.Linear(up_in, upscale_hidden)
         self.up2 = nn.Linear(upscale_hidden, upscale_hidden)
         self.recurrent = bool(recurrent)
@@ -425,7 +435,33 @@ class SplitObservationActor(nn.Module):
         else:
             self.gru = MemorylessAggregator(upscale_hidden, gru_hidden)
         self.head1 = nn.Linear(gru_hidden, head_hidden)
-        self.head_msg = nn.Linear(head_hidden, MESSAGE_SIZE)
+        # msg_head_prop_input (the transmission phase): the message head reads
+        # cat([g, prop]) instead of g alone. The beacon the head must emit --
+        # the robot's own believed position and confidence -- lives in prop
+        # (columns 8, 9, 12), NOT in the motor-oriented GRU state: measured on
+        # the val tape, a head-only fit on the frozen clone's g plateaus at
+        # 0.5 normalized position error (50 raw units, vs a 7-unit IR range)
+        # because nothing in BC ever required absolute position in the trunk.
+        # Feeding prop to the head makes the beacon a linear readout the
+        # supervision fits instantly, keeps the message pathway's gradients
+        # from having to re-purpose the trunk (which is what wrecked the warm
+        # start: kl 7, belief error 0.62->0.82 within 5 iterations when the
+        # head had to pull position through the shared trunk), and leaves the
+        # PPO gradient free to modulate the protocol through g. Checkpoint
+        # compat: head_msg is never trained by BC and is re-initialized at
+        # warm start (launch.apply_warm_start_message_policy's beacon readout)
+        # so a pre-flag checkpoint's head_msg weights are noise by
+        # construction -- the warm-start loader skips exactly those keys.
+        self.msg_head_prop_input = bool(msg_head_prop_input)
+        # Stored so checkpoint.architecture_meta can report the homing block
+        # by attribute (the same source-of-truth pattern as
+        # use_steer_feature/use_oracle_head) instead of inferring it from a
+        # raw column count -- which silently misreported use_turn_anchor the
+        # first time another optional block appended to up1 (T2's homing +3
+        # made every width-based inference in the meta wrong at once).
+        self.homing_proprio = bool(homing_proprio)
+        msg_in = head_hidden + (up_in - SPLIT_TC_SIZE) if self.msg_head_prop_input else head_hidden
+        self.head_msg = nn.Linear(msg_in, MESSAGE_SIZE)
         # +2 inputs when the steering feature is on: the wall-gated sine and
         # cosine of (tangent - heading), which IS the oracle's steering law in
         # wall_following. Measured before building it: that law reconstructs the
@@ -666,15 +702,26 @@ def split_motor_from_head(actor, g, prop_b):
     return actor.head_motor(g)
 
 
-def split_forward_batch(actor, tc_b, prop_b, h_prev):
-    # No image branch: the GRU's output goes straight into the policy head. The
-    # relative target bearing/distance inside prop_b replaces what the image
-    # branch could have taught the actor about where to go.
+def _split_trunk(actor, tc_b, prop_b, h_prev):
+    # The shared trunk of split_forward_batch: everything up to and including
+    # head1's activation g. Factored out so split_forward_batch and the
+    # message head's own supervised path (message_mean_headonly) run
+    # bit-identical trunk math -- the supervised beacon must see exactly the
+    # g the deployed forward sees, or the prior and the policy disagree.
     x = actor.relu(actor.up1(torch.cat([tc_b, prop_b], dim = 1)))
     x = actor.tanh(actor.up2(x))
     h_new = actor.gru(x, h_prev)
     g = actor.relu(actor.head1(h_new))
-    out_msg = actor.head_msg(g)
+    return g, h_new
+
+
+def split_forward_batch(actor, tc_b, prop_b, h_prev):
+    # No image branch: the GRU's output goes straight into the policy head. The
+    # relative target bearing/distance inside prop_b replaces what the image
+    # branch could have taught the actor about where to go.
+    g, h_new = _split_trunk(actor, tc_b, prop_b, h_prev)
+    msg_in = torch.cat([g, prop_b], dim = 1) if getattr(actor, "msg_head_prop_input", False) else g
+    out_msg = actor.head_msg(msg_in)
     motor_pre = split_motor_from_head(actor, g, prop_b)
     actor._motor_preact = motor_pre.detach()
     # config.py's own use_arrived_head has the full rationale. Deliberately
@@ -689,6 +736,22 @@ def split_forward_batch(actor, tc_b, prop_b, h_prev):
     actor._wall_logits = actor.head_wall(g) if getattr(actor, "head_wall", None) is not None else None
     mean = torch.cat([out_msg, motor_pre], dim = 1)
     return mean, h_new
+
+
+def message_mean_headonly(actor, tc_b, prop_b, h_prev):
+    """The message mean with the trunk STOPPED: gradients reach head_msg only.
+
+    ppo's auxiliary beacon supervision evaluates through this path, so the
+    prior can never re-purpose the shared trunk (the measured failure mode of
+    a trunk-connected supervision: kl 7/iter, motor behaviour collapsing with
+    it). The PPO surrogate's own gradient -- trust-region-clipped, and the
+    only channel through which the VALUE of the protocol can shape it -- still
+    flows through everything.
+    """
+    with torch.no_grad():
+        g, _ = _split_trunk(actor, tc_b, prop_b, h_prev)
+    msg_in = torch.cat([g, prop_b], dim = 1) if getattr(actor, "msg_head_prop_input", False) else g
+    return actor.head_msg(msg_in)
 
 
 
@@ -821,7 +884,9 @@ def build_actor(cfg):
                                      use_steer_feature = getattr(cfg, "use_steer_feature", False),
                                      use_oracle_head = getattr(cfg, "use_oracle_head", False),
                                      oracle_residual = getattr(cfg, "oracle_residual", 0.05),
-                                     oracle_residual_turn = getattr(cfg, "oracle_residual_turn", 0.0))
+                                     oracle_residual_turn = getattr(cfg, "oracle_residual_turn", 0.0),
+                                     msg_head_prop_input = getattr(cfg, "msg_head_prop_input", False),
+                                     homing_proprio = getattr(cfg, "homing_proprio", False))
     extra = len(priv_cols(cfg.actor_priv_mode))
     if actor_type == "gru":
         return RecurrentActor(extra = extra, hidden = cfg.gru_hidden)

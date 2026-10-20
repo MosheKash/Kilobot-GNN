@@ -935,3 +935,252 @@ observed global displacement), every one of 53 robots' true starting heading sat
 within a few degrees of +π/2, with a low-noise estimate of −90.02° mean /
 −90.07° median offset from the assumed 0. The fix was entirely Python-side; this
 rotation is unchanged and correct. (phases 80/81)
+
+## `reward.py` (the transmission phase)
+
+### `motor_log_std` / the warm-start log_std placeholder
+
+A bc_offline checkpoint's saved log_std is an untrained placeholder (std
+0.61): BC fits the mean, deterministic eval executes the mean, so nothing
+but RL's stochastic rollout ever samples from it. The first stochastic
+collection therefore drove the swarm on random wheel speeds and the warm
+start died at iteration 0, before any PPO update — the "reward function
+collapse" every phase 164-167 attempt was actually blaming. The override
+(KILOBOT_MOTOR_LOG_STD, launch.apply_warm_start_message_policy) starts
+motor exploration at std 0.082. (phase 168, root cause 1)
+
+### `arena_potential` and the corrected global-shaping sign
+
+The phase-164/165 shared potential paid `k*(prev_pot - gamma*pot)` for a
+HIGHER-is-better kernel — the exact negative of PBRS, rewarding the swarm
+for getting worse. Corrected to `k*(gamma*pot - prev_pot)`; it went
+unnoticed because every distance-shaped term in the file uses
+lower-is-better quantities, for which (prev - gamma*curr) is right. The
+potential also gained a belief-error band (sigma 0.20) because the
+settled kernel alone is flat (exp(-25) at d=0.5) across the entire
+localization phase a beacon speeds up — settle curve: 0.016 at tick 2000,
+0.63 at 8000. (phase 168, root causes 2-3)
+
+### `belief_errors` / `honest_confidences` and the both-sides NaN mask
+
+e_i = |filter mean - truth|, privileged and correctness-grounded (a
+confidently-wrong cloud keeps e large; phases 2/9's conf-bonus lesson
+respected). The per-robot PBRS mask must cover BOTH prev and current
+belief existence: a one-sided mask NaN'd the reward for 7 of 46 robots at
+the tick their belief first appeared. (phase 168)
+
+### `beacon_overclaim_penalty`
+
+PPO pushed the learned conf gate to 2.4x honest and the receiver fuses
+the MOST confident valid row, so overclaimed ~50-unit-wrong beacons
+always win the fusion slot. Penalized per tick in the reward because
+action-space supervision cannot hold the slot down: its gradient vanishes
+at tanh saturation (tanh'(2.0) ~ 0.02) exactly where conf sits. Honest
+caveat: at weight 4.0 the conf statistics barely moved; part of the
+apparent overclaim is the readout's own slope-2 conf mapping. (phase 168)
+
+## `kilobot_gnn.py` (the transmission phase)
+
+### `msg_head_prop_input` and `message_mean_headonly`
+
+head_msg reads cat([g, prop]) instead of g: the honest beacon is a
+readout of the robot's own filter state, but the motor-trained GRU trunk
+does not carry absolute position (head-only fit on the frozen clone
+plateaus at 0.5 normalized error = 50 units against a 7-unit IR range),
+and pulling position through the trunk was the measured wrecking ball
+(kl 7/iteration, motor mean drift 0.09 against the oracle's 0.0093-rms
+steering differential). The supervision evaluates through
+message_mean_headonly — the trunk is STOPPED — so the prior can never
+re-purpose the motor policy. head_msg is the one module a pre-flag
+checkpoint may load without: never BC-trained, re-initialized at warm
+start (launch.warm_start_load skips exactly those keys and refuses
+anything wider). (phase 168)
+
+## `trainer.py` (the transmission phase)
+
+### The late per-robot caches on reset
+
+_reset_arena reused local indices for new robots while
+_spawn_heading_cache, turn_anchor, belief_fit, belief_anchor and
+_stable_belief_heading kept the previous robots' entries — with
+oracle_known_start_heading the new robot's filter was told the old
+robot's spawn heading and could never localize (episode 2+ collapse:
+belief error above spawn level from tick one). Eval harnesses never reset
+arenas mid-run, so only training ever saw it. (phase 168, root cause 5)
+
+### The known-start-heading divergence
+
+eval_closed_loop.py and run_bc_monitored.py set
+oracle_known_start_heading=True; launch.py's RL path defaulted False and
+no recipe ever set it — so every RL run's filter started
+heading-uniform, never localized (conf_pos 0.004, the phase-167
+signature), and fed the clone features it never saw. Fourth instance of
+the family: any Config field an eval harness sets one way and launch.py
+cannot be told to set another is a standing divergence risk.
+(phase 168, root cause 4)
+
+## `belief.py` / `observation.py` / `actor_io.py` / `trainer.py` (phase 169, the settle-anchored wavefront)
+
+### `tc_peer_zero` (config / `sample_split_event`)
+
+Zeroes a peer row's message content (slots 0-8) in the actor's Tc, keeping
+only strength; wall-seed rows (negative senderId) pass through. Exists
+because phase 168's driver D was suspected to pay for an input-distribution
+shift (BC tapes' peer rows carried zeros in the message slots). Measured
+worth: 0.008 of settled -- real but small; the channel's harm goes through
+the filter path, not the trunk's input (docs/tuning.md phase 169, A1 vs D).
+Kept because it makes the receiver's input match the training distribution
+exactly for any beacon protocol, and it is the cleanest isolator for that
+question.
+
+### `peer_innovation_min` (`add_peer_range`)
+
+Fuse the chosen ring only if >= this fraction of the receiver's particles
+lie within 2*sigma of it. Built to stop "the liar wins the argmax slot".
+Measured: at 0.05 it does not change the outcome at all (A2 == A3 at 0.20
+to three decimals) -- a spread cloud covers any nearby ring band, true or
+false, at the same ~0.6 fraction, so per-ring consistency is blind exactly
+where fusion acts. The next discriminator is second-order (consensus
+between two distinct senders), not a stricter first-order gate.
+
+### `beacon_arrived_only` (`actor_io.act`, the honest-beacon override)
+
+Only a robot whose (protected) arrival latch has fired writes slots 0-2;
+moving robots are explicitly zeroed. An untrained head_msg output left in
+slots 0-2 is random noise that can clear PEER_CONF_MIN and fuse a garbage
+ring into every nearby filter. The gate call was hoisted above the beacon
+write so the broadcast always carries the PROTECTED latch state as of this
+decision.
+
+### `arrival_min_anchored` / `arrival_persist` (`_arrival_gate_protection`)
+
+The latch requires one direct seed/wall sighting this episode, and (for
+persist > 1) the condition to hold on consecutive decisions. Never releases
+an existing latch -- it only delays new ones. Measured on the clone with
+fusion disabled (A7): settled 0.691 vs the clone's 0.631, wrong-stops 0.273
+vs 0.325 -- the single largest comms-free improvement in the project, and
+the reason the RL stage's baseline is 0.691/0.310, not 0.631/0.285. With
+fusion ON it recovers less (A2/A4: 0.591-0.594) because the fused wrong
+rings still manufacture stops the protection cannot see coming.
+
+### Reset hygiene: `belief_ever_anchored`, `_arrival_persist`
+
+Popped by `_reset_arena` alongside the phase-168 cache list -- a stale
+"ever anchored" or persistence count is the previous robot's evidence, and
+fresh robots reuse local indices.
+
+## Phase 170 additions (2026-10-13): the transmission chapter's measured closures
+
+Every entry below is a measured verdict first, a mechanism second, and a
+symbol third. Full narratives live in `docs/tuning.md` phase 170 and the
+handover at the end of that file.
+
+### `--filter-seed` (`tools/eval_closed_loop.py`)
+
+The noise-floor probe was a NO-OP for its first two runs: it reseeded the
+global torch RNG, but every belief.py draw passes
+`generator=trainer.sample_rng` -- the filter's own Generator, seeded once
+from `cfg.seed` in `Trainer._init_globals`. Two "replicate" runs reproduced
+A7 bit-identically before anyone looked inside. The fix reseeds the
+trainer's generator too. The measured floor it finally enables: +-0.02-0.035
+settled across filter seeds, +-0.02 across arena sequences (~+-0.03 total
+on the 4-arena paired harness). Deltas below that are noise; several
+earlier single-cell comparisons were inside it.
+
+### `believed_dist` / `believed_conf` (`tools/eval_closed_loop.py`, `_final_state`)
+
+Per-robot readout of the filter's own mean-to-assigned-target distance and
+confidence, recorded in every eval's final snapshot. Built to decompose the
+wrong stops, and it did: 55% of A7's wrong stops sat in the 5-8u gate band
+(first hypothesis: tighten the gate -- REFUTED monotonically, the mass
+migrates to 8-20u because the filter under-reports distance while moving
+and a tighter gate means more overshoot), then the split into bucket A
+(41%, confidently wrong: conf >= 0.4, believed < 8u) and bucket B (59%,
+stale latches: final conf median 0.20 vs 0.80 for settled-right).
+
+### `closed_form_release` (+ `release_repudiate_conf`, `release_repudiate_dist`)
+
+(`actor_io._arrived_head_gate`.) Removes the closed-form latch's
+terminality behind a flag, default off. Three designs, three measured
+negatives: (1) stay-off-while-closed-form-holds churned 55,890
+releases/episode and lost 0.16 settled -- settled robots' conf dips below
+the 0.4 floor often enough that re-testing wakes them (29 settled disturbed
+per 12 wrong stops fixed), and a released robot cannot re-reach the parked
+latch floor while moving (poverty trap; moving 0.043 -> 0.262);
+(2) `KILOBOT_RELEASE_DEBUG` measured the learned arrived head saturating at
+p=1.000 on 786/786 already-off evaluations -- it keys on the parked
+observation, so it can never vote to release; (3) strong-repudiation-only
+(conf < 0.15 AND believed dist > 0.12) cut churn 3x and still lost 0.11
+(0.579 vs 0.691; woken robots wander at 18.5u median, unable to re-latch).
+Terminality is load-bearing. The 6 unit tests pin the implemented semantics
+as documentation of the negative.
+
+### `peer_conf_min` / `set_peer_conf_min` (`belief.py`, `trainer.py`)
+
+The receiver's usability gate, now runtime-configurable. Measured: the
+honest beacon's conf has median 0.80 for settled robots, so the historical
+0.85 filtered out most of the honest sender pool (the peer-fix probe's
+96%-zero usable histogram was a threshold mismatch, not sender scarcity).
+Widening to 0.70/0.60 changed NOTHING (conf is bimodal; senders cluster at
+the shape, receivers in need are mid-arena, 7u IR cannot bridge):
+geometry, not thresholds, starves the channel.
+
+### `beacon_anchored_min_conf` (`actor_io.act`, the beacon write)
+
+Mid-arena senders: an anchored robot (one direct seed/wall sighting this
+episode) with belief conf >= the bar broadcasts the honest beacon, instead
+of only-after-latch. Measured: conf 0.6/0.7 slightly harmful (0.676 vs
+0.691 -- noisier claims drag means), conf 0.8 statistically A7 (0.695; too
+few extra senders). The fixed-protocol sender space is measured out.
+
+### `hop_comms` (`observation.hop_flood_update`, `belief.add_hop_bounds`)
+
+The position-free protocol: per-robot IR-hop counts to the four corner
+seeds maintained by min-relaxation over received message slots 0-3 (slot =
+k+1, direct sighting = hop 0), fused as soft upper bounds
+(dist <= k * IR_RANGE_NORM). Robust by construction (integer minima
+self-correct; no sender mean enters) and measured STRONGLY NEGATIVE:
+0.337 vs A7's 0.691, wrong stops 0.631, wrong median 11.1u. Mechanism: a
+soft upper bound gives every particle inside the box ~equal weight -- the
+cloud relocates toward the box intersection, tightens, and the gate closes
+on a confidently-wrong mean; and by the time the flood converges to tight
+bounds, robots are already near the shape. The `hop` per-robot dict is
+popped by `_reset_arena` (a stale entry is the previous robot's graph
+distances).
+
+### `recv_gate` (`actor_io.act` capture, `observation.py` read, `belief.add_peer_range`)
+
+The learned RECEIVER, the last untried branch. The policy's own message
+slot 3 (free real estate: the beacon writes 0-2, supervision targets 0-2)
+maps to a trust gate g = 0.5*(v+1) in [0,1], stored per-robot between
+decisions, scaling next tick's fused-ring sigma by 1/g. g=1 reproduces the
+ungated receiver exactly (unit-tested); the knob's dynamic range is
+[0.5, 1] (below it rings are fully defused). Readout init plants
+`head_msg.bias[3] = 2.0` (g ~ 0.98 = status quo) so training starts at
+today's fusion. Trained 100 iters: the gate NEVER moved -- slot-3 bias
+2.0003/2.0007/2.0008/2.0001/2.0002 across iters 10-90, pure PPO noise
+(~370k decisions), and the eval pair differs by 0.002 between gate live
+and forced open. The receiver side has no exploitable gradient at the
+substrate-required actor LR (2e-5): the gate's output enters only its own
+filter, one tick delayed, through a sigma scaling. The channel closes
+symmetrically: neither side of a position-claim channel is learnable here.
+
+### Reset hygiene: `hop`, `recv_gate`
+
+Both added to the `_reset_arena` pop list alongside
+`belief_ever_anchored`/`_arrival_persist`/`_peer_inject_tick`: a stale hop
+count is the previous robot's graph distances; a stale gate is the previous
+robot's fusion trust. Same leak family as the phase-168 caches.
+
+### Infrastructure: systemd --user units for training (see tuning.md handover)
+
+Three consecutive full-system crashes were traced to training running
+inside the terminal's cgroup (16 players + 2 learners: 21.8G memory +
+21.5G swap peak in Konsole's scope; zram swap is RAM). setsid does not
+escape a cgroup. The fix: `systemd-run --user --unit=<name> -p MemoryMax=16G`
+(linger enabled), the conda env's python named explicitly (the user
+manager has no activation), arms run sequentially (learner ~7-8.6G host
+RSS each; concurrent arms crash the box), `MALLOC_ARENA_MAX=2` +
+`MALLOC_TRIM_THRESHOLD_` for the learner, and background work launched
+only from script files (inline `nohup` in a timing-out tool call dies with
+the call's process group).

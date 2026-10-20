@@ -186,6 +186,34 @@ These change what a run does, for debugging rather than training. Most are descr
 | `KILOBOT_VAL_TAPE` | unset | Path to a recorded validation tape. Replayed every `KILOBOT_VAL_TAPE_INTERVAL` iterations to report held-out per-state imitation error -- what BC actually optimises -- with no simulation cost. |
 | `KILOBOT_VAL_TAPE_INTERVAL` | `5` | How often to replay it. |
 
+## RL fine-tune reward and message start
+
+Added for the reward-based fine-tuning phase (docs/tuning.md phases 164-165).
+All default off / unchanged, so no existing run changes behaviour.
+
+| Variable | Config field | Default | Meaning |
+|---|---|---|---|
+| `KILOBOT_REWARD_MODE` | `reward_mode` | `normal` | `target` replaces the any-pixel shape income (r_on/off_penalty/pack) with the per-robot terms below: the separation term survives, and accuracy income pays for being at the robot's OWN assigned pixel. |
+| `KILOBOT_TARGET_ACC_WEIGHT` | `target_acc_weight` | `1.0` | Per-step accuracy income `w · exp(-(d_i/σ)²) · dt` -- pays for BEING at the robot's own assigned pixel, tightest arrivals most. Localization is rewarded instrumentally (a robot that has not figured out where it is cannot find the pixel); no separate confidence bonus, per the measured phase-2/9 lesson that paying for confidence directly makes a confidently-wrong cloud profitable. |
+| `KILOBOT_TARGET_ACC_SIGMA` | `target_acc_sigma` | `0.05` | Kernel width, normalized units (0.05 = 5 raw units, the settle metric's primary bar). |
+| `KILOBOT_TARGET_TIME_COST` | `target_time_cost` | `0.0` | Explicit speed pressure: `w_time · dt` subtracted per step **only while the robot is unsettled** (true distance past `stop_radius`); a settled robot stops paying. The conditionality is load-bearing, not tuning: an unconditional per-step constant pays an identical total on every equal-length trajectory, the value baseline absorbs it exactly, and no advantage changes -- a policy-gradient no-op. Charged only while unsettled, settling sooner genuinely pays, and the relief bar is TRUE distance, not the latch flag, so a robot the gate falsely latched far away keeps paying (wrong parking buys no relief). Together with the γ discount on the accuracy income (earlier income worth more), this is the "as quickly as possible" half of the objective. `0.1` is a reasoned starting point (~10% of the max accuracy income). |
+| `KILOBOT_TARGET_SHAPING` | `target_shaping` | `0.0` | Potential-based shaping `k·(prev_d − γ·d)` per robot on the normalized distance to its OWN assigned target (`observation.ensure_target`, python-side geometry -- immune to the baked-field rotation). Carries the long-horizon approach gradient that the per-step income alone cannot (γ's effective horizon is ~100 steps). Policy-invariant, so **not** annealed. `5.0` is a reasoned starting point by analogy with `reward_shaping`. |
+| `KILOBOT_STOP_BONUS` | `stop_bonus` | `0.0` | One-time bonus paid the tick after the arrival gate latches a robot (actor-driving modes only), **graded** by true distance: `B · exp(-(d/stop_radius)²)`. Full bonus only for a tight arrival; a gate false positive far from the pixel earns ~nothing. The gate itself stays frozen during RL. |
+| `KILOBOT_STOP_RADIUS` | `stop_radius` | `0.05` | Kernel width of the graded stop bonus, normalized (0.05 = 5 raw units). Also the settled bar when `success_metric=settled`. |
+| `KILOBOT_GLOBAL_SHAPING` | `global_shaping` | `0.0` | Shared arena-level potential for **sender credit**: `k·(prev_pot − γ·pot)` added equally to every robot in the arena, where `pot` is the SMOOTH mean kernel `mean_i exp(-(d_i/σ_g)²)` over resolvable targets. A threshold potential was rejected: it is flat almost everywhere and would only credit a sender at the exact tick a neighbour crosses the bar. This is what makes broadcasting learnable under per-robot GAE -- a message that improves a neighbour's approach raises every sender's own return, including mid-approach where a helpful message actually does its work. |
+| `KILOBOT_GLOBAL_POTENTIAL_SIGMA` | `global_potential_sigma` | `0.10` | Width of that shared kernel -- deliberately wider than the accuracy kernel so sender credit has gradient from farther out. |
+| `KILOBOT_SUCCESS_METRIC` | `success_metric` | `coverage` | `settled` makes the success/reset condition the settled fraction (same bar as the stop bonus) instead of coverage -- aligning arena recycling with the objective. Repurposes the `cov` variable and the `oracle_cov`/`actor_eval_cov`/`mean_final_coverage` log names, exactly the phase-153 pattern: those names then mean settled fraction, not coverage. |
+| `KILOBOT_QUIET_MSG_HEAD` | `quiet_msg_head` | `0` | With `KILOBOT_INIT_ACTOR`, zero the split actor's message head after loading, so broadcasts start at exactly zero -- the distribution the BC tapes' receivers were trained on (oracle-driven tapes broadcast zeros; BC never supervises the message head, so a warm-started `head_msg` is random noise). |
+| `KILOBOT_MSG_LOG_STD` | `msg_log_std` | `0.0` (keep loaded) | Overwrite the loaded per-dimension log-std on the **message dimensions only** after the warm start (motor dims keep the checkpoint's). A value below `KILOBOT_LOG_STD_MIN` needs that floor lowered too (e.g. `-4.0` on both). Start quiet; the entropy bonus grows message exploration over the run. |
+| `KILOBOT_MSG_LOG_STD_MAX` | — (env-only, like `KILOBOT_LOG_STD_MIN`/`MAX`) | `KILOBOT_LOG_STD_MAX` | Separate ceiling on the **message dimensions'** effective std. The entropy bonus pushes every dimension's std toward the global ceiling; motor dims have a fast counter-signal (a noisy motor sample loses reward immediately), but a message dim's value signal reaches its sender only through the receivers' shared potential -- diluted ~1/m and delayed -- so without a tighter cap the message dims' std can climb to 1.0 and the receivers' Tc degenerates into uniform noise. `-2.3` caps message std at 0.1; unset leaves the global ceiling. |
+
+`KILOBOT_BAKE_ROTATION_STEPS` also now defaults to **0** for every
+`launch.py`-launched player (it was only ever set by `tools/eval_closed_loop.py`
+before): at the player's own default of 1 the baked distance field behind
+`coverage`, `on_bonus`, `off_penalty` and the legacy `reward_shaping` is
+formations.py's geometry rotated 90 degrees (phase 156). Set it back to 1
+explicitly only if you specifically want the historical behaviour.
+
 ## Arrived head and turn anchor
 
 Both change the actor's architecture, so a checkpoint trained with one will not load without it.
@@ -243,6 +271,23 @@ flags, because they select the *deployed* decision only. See the report in
 | `use_closed_form_arrived` | `--closed-form-arrived` | `False` | Gate the actor's stop on the oracle's own rule computed from the actor's filter, instead of the learned arrived head. The rule's slots in the observation's property vector: `PROP_CONF_POS` (12), `PROP_SIN_T`/`PROP_COS_T` (19, 20), `PROP_DIST_T` (21). Terminal, like the oracle's arrived state. |
 | `closed_form_arrival_dist` | `--closed-form-dist` | `0.0` (uses `cfg.tau_v`, `0.05`) | Arrival radius in normalised units. The actor's own filter under-reports closeness (empirically `d_target` ~1.5&times; the true distance at arrival), so `tau_v` stops almost nobody and the swarm orbits; `0.08` is the value measured to park robots where the filter certifies arrival. |
 | `closed_form_hybrid` | `--closed-form-hybrid` | `False` | With `use_closed_form_arrived`, run the closed-form rule in OR with the learned head instead of replacing it: the head under-fires on low-confidence near robots, the closed form certifies only tight arrivals, and the two miss different robots, so the OR is a strict superset of either branch alone. The latch is terminal either way. |
+
+## Transmission machinery and latch release (phase 170)
+
+All default off / unchanged; each is a measured result documented in
+`docs/tuning.md` phase 170. See also `docs/code-history.md` under each
+symbol.
+
+| Variable | Config field | Default | Meaning |
+|---|---|---|---|
+| `KILOBOT_CLOSED_FORM_RELEASE` | `closed_form_release` | `0` | Removes the closed-form latch's terminality: a latched robot can wake on STRONG REPUDIATION (below). Three designs measured negative (plain closed-form re-test churned 55,890 releases/episode, lost 0.16 settled; the learned arrived head saturates at p=1.000 when parked so it can never vote to release; strong-repudiation-only still lost 0.11 -- woken robots cannot re-latch while their filter is moving). Kept as documented negative. |
+| `KILOBOT_RELEASE_REPUDIATE_CONF` | `release_repudiate_conf` | `0.15` | Release-v3's confidence bar: a latched robot wakes only when its belief conf is below this AND the believed distance is beyond the dist bar. |
+| `KILOBOT_RELEASE_REPUDIATE_DIST` | `release_repudiate_dist` | `0.12` | Release-v3's believed-distance bar (normalized; 0.12 = 12 raw units), targeting the stale-latch population whose belief drifted 16-35u from where it parked. |
+| `KILOBOT_PEER_CONF_MIN` | `peer_conf_min` | `0.85` | The receiver's usability gate for a peer beacon (`belief.PEER_CONF_MIN`, runtime-settable). Measured: the honest beacon's conf has median 0.80 for settled robots, so 0.85 filtered out most of the honest sender pool; widening it changed nothing (conf is bimodal; geometry, not thresholds, starves the channel). |
+| `KILOBOT_BEACON_ANCHORED_MIN_CONF` | `beacon_anchored_min_conf` | `0.0` | Mid-arena sender gate: with belief-comms on, an anchored robot (one direct seed/wall sighting this episode) with belief conf >= this bar broadcasts, instead of only-after-latch. Measured: 0.6/0.7 slightly harmful (noisier claims drag means), 0.8 statistically A7. Takes precedence over `beacon_arrived_only` when > 0. |
+| `KILOBOT_HOP_COMMS` | `hop_comms` | `0` | The hop-count protocol: robots maintain IR-hop distances to the four corner seeds by min-relaxation over received message slots 0-3 and broadcast them; receivers fuse the counts as soft upper bounds on euclidean distance. Measured STRONGLY negative (0.337 vs A7's 0.691): box interiors give particles equal weight, so the cloud relocates toward the box intersection and tightens onto a confidently-wrong mean. Kept as documented negative; the prune-only variant is the untested remnant. |
+| `KILOBOT_RECV_GATE` | `recv_gate` | `0` | The learned RECEIVER: the policy's own message slot 3 maps to a trust gate g in [0,1] scaling that robot's fused-ring sigma by 1/g (g=1 = ungated exactly). Readout init plants g~0.98. Trained 100 iters: the gate never moved (pure PPO noise across ~370k decisions) -- no exploitable gradient at the substrate-required actor LR. Kept as documented negative. |
+| `KILOBOT_RESUME` | -- | unset | Path to a `ckpt.pt` to continue from. The checkpoint carries policy, critic, BOTH optimizer states, and the iteration counter; a resumed run's first iteration prints the restored EV (0.78+) and the original step count -- the verification that state carried over. |
 
 ## Run summary
 

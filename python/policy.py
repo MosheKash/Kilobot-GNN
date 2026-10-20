@@ -41,6 +41,15 @@ def squash_log_det(u):
 # KILOBOT_LOG_STD_MIN == KILOBOT_LOG_STD_MAX fixes std exactly (e.g. -3.91 -> 0.02).
 LOG_STD_MIN = float(os.environ.get("KILOBOT_LOG_STD_MIN", -2.0))
 LOG_STD_MAX = float(os.environ.get("KILOBOT_LOG_STD_MAX", 0.0))
+# Separate ceiling for the MESSAGE dimensions only. The entropy bonus pushes
+# every dimension's std toward LOG_STD_MAX; motor dims have a strong, fast
+# counter-signal (a noisy motor sample loses reward immediately), but a message
+# dim's value signal reaches its own sender only through the receivers' shared
+# potential -- diluted ~1/m and delayed -- so with the global ceiling the
+# message dims' std can climb to 1.0 and the receivers' Tc input degenerates
+# into uniform noise (docs/tuning.md phase 166). Defaults to LOG_STD_MAX, so
+# nothing changes unless set (e.g. -2.3 -> std 0.1).
+MSG_LOG_STD_MAX = float(os.environ.get("KILOBOT_MSG_LOG_STD_MAX", LOG_STD_MAX))
 
 
 class GaussianPolicy(nn.Module):
@@ -50,7 +59,15 @@ class GaussianPolicy(nn.Module):
         self.log_std = nn.Parameter(torch.full((ACTION_SIZE,), float(log_std_init)))
 
     def _std(self):
-        return self.log_std.clamp(LOG_STD_MIN, LOG_STD_MAX).exp()
+        std = self.log_std.clamp(LOG_STD_MIN, LOG_STD_MAX)
+        # Per-kind ceiling: message dims capped tighter than motor dims (see
+        # MSG_LOG_STD_MAX above). Applied to the sampled/evaluated std, not
+        # the parameter, so the clamp's zero gradient where binding is the
+        # intended behavior: the entropy bonus cannot push the effective
+        # message noise past the cap.
+        std = torch.cat([std[:MESSAGE_SIZE].clamp(max=MSG_LOG_STD_MAX),
+                         std[MESSAGE_SIZE:]])
+        return std.exp()
 
     def clamp_log_std(self):
         with torch.no_grad():
@@ -145,4 +162,7 @@ class GaussianPolicy(nn.Module):
         dist = torch.distributions.Normal(mean, std)
         log_prob = dist.log_prob(action_b).sum(dim = 1) - squash_log_det(action_b)
         entropy = dist.entropy().sum(dim = 1)
-        return log_prob, entropy
+        # mean returned alongside so ppo's auxiliary message supervision can
+        # target the policy's own broadcast content (docs/tuning.md, the
+        # transmission phase); no other caller uses it.
+        return log_prob, entropy, mean

@@ -33,6 +33,7 @@ class EnvWorker:
         self.belief = {}
         self.track_seed = {}
         self.pending_find_reward = {}
+        self.pending_stop_bonus = {}
         self.step_count = {}
         self.traj_id = {}
         self.ep_reward = {}
