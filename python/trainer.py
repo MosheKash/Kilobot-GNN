@@ -541,7 +541,10 @@ class Trainer:
             # position otherwise. Both are per-robot fractions on [0, 1] and
             # feed the same accumulator, but they answer different questions
             # and must not be confused -- see rollout_stats' own consumers.
-            if self.cfg.motor_override == "simple_oracle":
+            # simple_state is shared by both oracle flavors (renewal_oracle.py
+            # writes the same attr so this label and everything downstream of
+            # it work unchanged); see renewal_oracle.py's module docstring.
+            if self.cfg.motor_override in ("simple_oracle", "renewal_oracle"):
                 arrived_here = getattr(worker, "simple_state", {}).get(k, {})
                 arrived_count = sum(1 for l in range(m) if arrived_here.get(l) == "arrived")
                 cov = arrived_count / m if m > 0 else 0.0

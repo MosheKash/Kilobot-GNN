@@ -45,7 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 def build_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
-    ap.add_argument("--mode", choices = ["oracle", "actor"], required = True)
+    ap.add_argument("--mode", choices = ["oracle", "renewal", "actor"], required = True)
     ap.add_argument("--weights", default = None, help = "actor checkpoint (required for --mode actor)")
     ap.add_argument("--ticks", type = int, default = 12000)
     ap.add_argument("--sample-every", type = int, default = 200,
@@ -246,6 +246,43 @@ def build_parser():
                            "on the same shapes; their delta is pure filter noise")
     ap.add_argument("--device", default = "cuda")
     ap.add_argument("--base-port", type = int, default = 5500)
+    # The amended task (true wheel slip, MotionNoise.cs). The slip flags are
+    # exported as KILOBOT_SLIP_* before any player starts (the player reads
+    # them in Awake/Start); --motion-noise / --heading-noise are the Python
+    # filter's model of that slip (belief.MOTION_NOISE and the predict/update
+    # heading_noise_scale the renewal oracle passes). Defaults read the same
+    # env vars launch.py does, so a launch-style env reproduces here.
+    ap.add_argument("--slip-bias", type = float,
+                    default = float(os.environ.get("KILOBOT_SLIP_SIGMA_BIAS", "0") or 0),
+                    help = "KILOBOT_SLIP_SIGMA_BIAS: per-robot persistent wheel mismatch sigma")
+    ap.add_argument("--slip-tick", type = float,
+                    default = float(os.environ.get("KILOBOT_SLIP_SIGMA_TICK", "0") or 0),
+                    help = "KILOBOT_SLIP_SIGMA_TICK: per-FixedUpdate random wheel slip sigma")
+    ap.add_argument("--slip-seed", type = int,
+                    default = int(os.environ.get("KILOBOT_SLIP_SEED", "0") or 0))
+    ap.add_argument("--motion-noise", type = float,
+                    default = float(os.environ.get("KILOBOT_MOTION_NOISE", "0") or 0),
+                    help = "belief.MOTION_NOISE: the filter's position-noise model of the slip")
+    ap.add_argument("--heading-noise", type = float,
+                    default = float(os.environ.get("KILOBOT_RENEWAL_HEADING_NOISE", "0") or 0),
+                    help = "cfg.renewal_heading_noise: the renewal oracle's filter heading noise")
+    ap.add_argument("--cfg", action = "append", default = [], metavar = "FIELD=VALUE",
+                    help = "override any existing Config field (repeatable), typed by the "
+                           "field's current value, e.g. --cfg renewal_heading_drift=0.003. "
+                           "Meant for fields no other flag sets (the renewal_* knobs): it is "
+                           "applied with the slip flags, so a field a later flag assigns "
+                           "(the actor/gate ones) is overwritten by that flag. Unknown "
+                           "field = error")
+    ap.add_argument("--seed-layout", default = "corners", choices = ["corners", "quarters"],
+                    help = "KILOBOT_SEED_LAYOUT for the player and belief.SEED_LAYOUTS: 'quarters' "
+                           "moves the four seeds to mid-arena landmarks (phase 175 experiment)")
+    ap.add_argument("--landmarks", action = "store_true",
+                    help = "KILOBOT_LANDMARKS=1: four mid-arena landmark beacons broadcasting their "
+                           "position over the neighbour message channel (phase 175)")
+    ap.add_argument("--debug-wall-log", action = "store_true",
+                    help = "cfg.oracle_debug_wall_log: the oracles' per-robot transition / "
+                           "diagnostic prints (renewal: RENEWAL_TURN_DONE true heading error "
+                           "after the fixed 90-degree turn)")
     ap.add_argument("--headed", action = "store_true",
                     help = "show a LIVE Unity window (no_graphics=False) and stream the same "
                            "coverage/stopped/settled console numbers as the headless run. Use "
@@ -381,7 +418,9 @@ def main(argv = None):
 
     cfg = Config()
     cfg.actor_type = "gru_split_observation"
-    cfg.seed_layout = "corners"
+    cfg.seed_layout = args.seed_layout
+    cfg.landmarks = bool(args.landmarks)
+    os.environ["KILOBOT_LANDMARKS"] = "1" if cfg.landmarks else "0"
     cfg.heartbeat_ticks = args.heartbeat
     cfg.rollout_steps = args.sample_every
     cfg.num_arenas = args.arenas
@@ -446,7 +485,39 @@ def main(argv = None):
     cfg.peer_fix_resid_max = float(args.peer_fix_resid_max)
     cfg.peer_inject_min_spread = float(args.peer_inject_min_spread)
     cfg.peer_inject_cooldown_ticks = int(args.peer_inject_cooldown_ticks)
-    cfg.motor_override = "simple_oracle" if args.mode == "oracle" else "none"
+    # "renewal" selects the amended-task baseline (renewal_oracle.py) -- pair
+    # it with the slip env vars (KILOBOT_SLIP_*) for the noisy-odometry task.
+    cfg.motor_override = {"oracle": "simple_oracle",
+                          "renewal": "renewal_oracle"}.get(args.mode, "none")
+    cfg.slip_sigma_bias = float(args.slip_bias)
+    cfg.slip_sigma_tick = float(args.slip_tick)
+    cfg.slip_seed = int(args.slip_seed)
+    cfg.motion_noise = float(args.motion_noise)
+    cfg.renewal_heading_noise = float(args.heading_noise)
+    cfg.oracle_debug_wall_log = bool(args.debug_wall_log)
+    for kv in args.cfg:
+        key, _, val = kv.partition("=")
+        if not hasattr(cfg, key):
+            raise SystemExit("--cfg: no Config field %r" % key)
+        cur = getattr(cfg, key)
+        if isinstance(cur, bool):
+            parsed = val.strip().lower() in ("1", "true", "yes", "on")
+        elif isinstance(cur, int):
+            parsed = int(val)
+        elif isinstance(cur, float):
+            parsed = float(val)
+        else:
+            parsed = val
+        setattr(cfg, key, parsed)
+        print("cfg override: %s = %r" % (key, parsed), flush = True)
+    os.environ["KILOBOT_SLIP_SIGMA_BIAS"] = repr(cfg.slip_sigma_bias)
+    os.environ["KILOBOT_SLIP_SIGMA_TICK"] = repr(cfg.slip_sigma_tick)
+    os.environ["KILOBOT_SLIP_SEED"] = str(cfg.slip_seed)
+    import belief as _belief_mod
+    _belief_mod.MOTION_NOISE = cfg.motion_noise
+    print("slip: bias=%r tick=%r seed=%d | filter MOTION_NOISE=%r heading_noise=%r"
+          % (cfg.slip_sigma_bias, cfg.slip_sigma_tick, cfg.slip_seed,
+             cfg.motion_noise, cfg.renewal_heading_noise), flush = True)
     # Nothing may end an episode during an evaluation: a reset mid-run would
     # restart the swarm on a new formation and the curve would measure two
     # different problems glued together. Coverage cannot exceed 1.0 and the
@@ -669,7 +740,7 @@ def main(argv = None):
 
 def _per_robot_stopped(worker, k, m, mode):
     """Which robots have decided they are done, one flag each."""
-    if mode == "oracle":
+    if mode in ("oracle", "renewal"):
         st = getattr(worker, "simple_state", {}).get(k, {})
         return [bool(st.get(l) == "arrived") for l in range(m)]
     off = getattr(worker, "arrived_switched_off", {}).get(k, {})
@@ -704,7 +775,7 @@ def _stopped_fraction(worker, k, m, mode):
     """
     if m <= 0:
         return 0.0
-    if mode == "oracle":
+    if mode in ("oracle", "renewal"):
         st = getattr(worker, "simple_state", {}).get(k, {})
         return sum(1 for l in range(m) if st.get(l) == "arrived") / float(m)
     off = getattr(worker, "arrived_switched_off", {}).get(k, {})
@@ -712,7 +783,7 @@ def _stopped_fraction(worker, k, m, mode):
 
 
 def _sample(trainer, workers, cfg, coverage, ticks):
-    mode = "oracle" if cfg.motor_override == "simple_oracle" else "actor"
+    mode = {"simple_oracle": "oracle", "renewal_oracle": "renewal"}.get(cfg.motor_override, "actor")
     covs, dists, stops, per_arena = [], [], [], []
     for wi, worker in enumerate(workers):
         for k in range(cfg.num_arenas):
@@ -785,8 +856,9 @@ def _final_state(trainer, workers, cfg, formation_pool, image_names = None):
                      "image_id": int(image_id) if image_id is not None else None,
                      "pos": (node[:, 0:2] * ARENA_HALF).tolist(), "dist": node[:, 4].tolist(),
                      "target": _assigned_targets(worker, k, m),
-                     "stopped_flags": _per_robot_stopped(
-                         worker, k, m, "oracle" if cfg.motor_override == "simple_oracle" else "actor")}
+                      "stopped_flags": _per_robot_stopped(
+                          worker, k, m, {"simple_oracle": "oracle",
+                                         "renewal_oracle": "renewal"}.get(cfg.motor_override, "actor"))}
             # Believed-vs-true diagnostic (the wrong-stop attribution): the
             # filter's OWN mean position and confidence per robot, so the
             # latch decision's inputs can be compared with truth after the

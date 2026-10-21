@@ -62,6 +62,18 @@ public class SwarmManager : MonoBehaviour
     public float minSpawnSeparation = 5f;
 
     const float IR_RANGE = 7f; // matches the real Kilobot platform's short-range IR (project units are cm)
+    // Mid-arena landmarks (phase 175, owner sign-off 2026-10-21): stationary
+    // beacons that broadcast their own position over the SAME IR message
+    // channel robots use -- an honest-beacon row (slots 0-1 position
+    // normalized by arenaHalfExtent, slot 2 conf 1.0, slot 8 = 1 landmark
+    // flag), sender id LANDMARK_SENDER_BASE + k (above any robot's). They
+    // join the single-receiver draw like any neighbour message, so the
+    // observation layout (SEED_SIZE, wallObs) is unchanged. Off unless
+    // KILOBOT_LANDMARKS=1. Positions must match python's LANDMARK_POS.
+    const float LANDMARK_FRAC = 0.45f;
+    const int LANDMARK_SENDER_BASE = 100000;
+    bool landmarksOn;
+    readonly List<GameObject> landmarks = new List<GameObject>();
     const int SEED_COUNT = 4;   // the origin point is gone; four corners remain
     const int WALL_SIZE = 4;
     // worst case a robot at the true boundary sees sqrt(WALL_SEED_INSET^2 + (WALL_SPACING/2)^2)
@@ -241,8 +253,17 @@ public class SwarmManager : MonoBehaviour
         // single training number appeared. Turn it on when investigating wall
         // seeds specifically; the one-line summary is always printed instead.
         debugWallSeeds = ParseBoolEnv("KILOBOT_DEBUG_WALL_SEEDS", false);
+        // True wheel-slip dials, parsed before any robot exists to draw its
+        // per-robot bias from them (see MotionNoise.cs -- the amended task).
+        // Idempotent across the per-arena SwarmManager instances.
+        MotionNoise.ConfigureFromEnv();
         SpawnSeeds();
         SpawnWallSeeds();
+        landmarksOn = ParseBoolEnv("KILOBOT_LANDMARKS", false);
+        if (landmarksOn)
+        {
+            SpawnLandmarks();
+        }
         SeedSwarmRng();
         SpawnKilobots();
         Debug.Log("SwarmManager arena " + arenaId + ": " + kilobots.Count + " kilobots, "
@@ -319,7 +340,7 @@ public class SwarmManager : MonoBehaviour
         return fallback;
     }
 
-    static int ParseSignedIntEnv(string name, int fallback)
+    internal static int ParseSignedIntEnv(string name, int fallback)
     {
         string env = System.Environment.GetEnvironmentVariable(name);
         int parsed;
@@ -351,13 +372,38 @@ public class SwarmManager : MonoBehaviour
         return v == "1" || v == "true" || v == "yes" || v == "on";
     }
 
+    // Non-negative only, like ParseIntEnv: the one user of this is the
+    // wheel-slip sigmas MotionNoise.cs reads, which are magnitudes. Invariant
+    // culture: a locale with a comma decimal separator must not turn "0.02"
+    // into "unset".
+    internal static float ParseFloatEnv(string name, float fallback)
+    {
+        string env = System.Environment.GetEnvironmentVariable(name);
+        float parsed;
+        if (!string.IsNullOrEmpty(env) && float.TryParse(env, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out parsed) && parsed >= 0f)
+        {
+            return parsed;
+        }
+        return fallback;
+    }
+
     void SpawnSeeds()
     {
         float c = arenaHalfExtent - spawnMargin;
         // "cluster" is DEPRECATED, DO NOT USE -- kept only for backward
         // compatibility, not run in a long time. "corners" (the else branch
         // below) is the only supported layout.
-        if (seedLayout == "cluster")
+        if (seedLayout == "quarters")
+        {
+            // Sparse mid-arena landmarks at the quarter points (phase 175
+            // experiment); must match belief.SEED_LAYOUTS["quarters"].
+            float q = arenaHalfExtent * 0.45f;
+            AddSeed(SeedType.UpperLeft, new Vector3(-q, 0f, q));
+            AddSeed(SeedType.UpperRight, new Vector3(q, 0f, q));
+            AddSeed(SeedType.LowerLeft, new Vector3(-q, 0f, -q));
+            AddSeed(SeedType.LowerRight, new Vector3(q, 0f, -q));
+        }
+        else if (seedLayout == "cluster")
         {
             AddSeed(SeedType.UpperLeft, new Vector3(22f, 0f, 0f));
             AddSeed(SeedType.UpperRight, new Vector3(11f, 0f, 19f));
@@ -370,6 +416,21 @@ public class SwarmManager : MonoBehaviour
             AddSeed(SeedType.UpperRight, new Vector3(c, 0f, c));
             AddSeed(SeedType.LowerLeft, new Vector3(-c, 0f, -c));
             AddSeed(SeedType.LowerRight, new Vector3(c, 0f, -c));
+        }
+    }
+
+    void SpawnLandmarks()
+    {
+        float q = arenaHalfExtent * LANDMARK_FRAC;
+        Vector3[] pos = { new Vector3(-q, 0f, q), new Vector3(q, 0f, q),
+                          new Vector3(-q, 0f, -q), new Vector3(q, 0f, -q) };
+        foreach (Vector3 lp in pos)
+        {
+            // the seed prefab's body, but NOT in `seeds`: seedObs stays the
+            // four corner seeds
+            GameObject go = Instantiate(seedPrefab, transform.position + lp, Quaternion.identity, transform);
+            go.name = "Landmark";
+            landmarks.Add(go);
         }
     }
 
@@ -828,6 +889,23 @@ public class SwarmManager : MonoBehaviour
                 }
             }
 
+            for (int k = 0; k < landmarks.Count; k++)
+            {
+                float d = PlanarDistance(pa, landmarks[k].transform.position);
+                if (d <= IR_RANGE)
+                {
+                    Vector3 local = landmarks[k].transform.position - transform.position;
+                    float[] row = new float[MESSAGE_SIZE + 2];
+                    row[0] = local.x / arenaHalfExtent;
+                    row[1] = local.z / arenaHalfExtent;
+                    row[2] = 1f;
+                    row[MESSAGE_SIZE - 1] = 1f;
+                    row[MESSAGE_SIZE] = LANDMARK_SENDER_BASE + k;
+                    row[MESSAGE_SIZE + 1] = 1f / (1f + d);
+                    a.receivedMessages.Add(row);
+                }
+            }
+
             for (int s = 0; s < seeds.Count; s++)
             {
                 float d = PlanarDistance(pa, seeds[s].transform.position);
@@ -886,8 +964,16 @@ public class SwarmManager : MonoBehaviour
                     if (wallSeeds[winnerSeedIdx].nearCorner)
                     {
                         float[] wsRow = new float[MESSAGE_SIZE + 2];
-                        wsRow[0] = wallSeeds[winnerSeedIdx].transform.position.x;
-                        wsRow[1] = wallSeeds[winnerSeedIdx].transform.position.z;
+                        // ARENA-LOCAL, like every other position Python sees
+                        // (robot positions are made local the same way, see
+                        // AppendNode). The world position was sent
+                        // before: correct only for arena 0 at the origin --
+                        // arenas 1-3 sit 260u apart on SceneBootstrap's grid,
+                        // so their near-corner pins pointed 260u outside the
+                        // arena and pulled every cloud off (phase 175: exit
+                        // error 5 / 10 / 12 / 24u by arena index).
+                        wsRow[0] = wallSeeds[winnerSeedIdx].transform.position.x - transform.position.x;
+                        wsRow[1] = wallSeeds[winnerSeedIdx].transform.position.z - transform.position.z;
                         wsRow[MESSAGE_SIZE] = -(s + 1);
                         wsRow[MESSAGE_SIZE + 1] = a.wallObs[s];
                         a.receivedMessages.Add(wsRow);

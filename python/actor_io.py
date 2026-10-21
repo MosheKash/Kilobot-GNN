@@ -234,14 +234,35 @@ def _drive_simple_oracle(worker, arena_ids, locals_, walls, cfg, rng, device,
     valid = None
     if rows is not None:
         valid = rows.abs().sum(dim = 2) > 0
-    motor = simple_oracle.simple_oracle_motors(worker, arena_ids, locals_, walls,
-                                               wall_seed_xy, cfg, rng,
-                                               getattr(cfg, "_oracle_formation_pool", None),
-                                               seeds = seeds, rows = rows, valid = valid)
+    # The amended-task oracle dispatch (2026-10-20): KILOBOT_MOTOR_OVERRIDE=
+    # renewal_oracle selects renewal_oracle.renewal_oracle_motors -- the
+    # renewal-cycle baseline for noisy odometry (renewal_oracle.py's module
+    # docstring) -- with simple_oracle.py untouched as the exact-motion
+    # baseline. Same signature, same call shape, so everything around this
+    # call is shared verbatim.
+    if cfg.motor_override == "renewal_oracle":
+        import renewal_oracle
+        motor = renewal_oracle.renewal_oracle_motors(worker, arena_ids, locals_, walls,
+                                                    wall_seed_xy, cfg, rng,
+                                                    getattr(cfg, "_oracle_formation_pool", None),
+                                                    seeds = seeds, rows = rows, valid = valid)
+    else:
+        motor = simple_oracle.simple_oracle_motors(worker, arena_ids, locals_, walls,
+                                                   wall_seed_xy, cfg, rng,
+                                                   getattr(cfg, "_oracle_formation_pool", None),
+                                                   seeds = seeds, rows = rows, valid = valid)
     for i in range(n):
         a = int(arena_ids[i]); l = int(locals_[i])
         worker.last_motor.setdefault(a, {})[l] = motor[i].detach().clone()
         worker.last_dec_step.setdefault(a, {})[l] = worker.step_count.get(a, 0)
+        # renewal oracle's simple peer protocol (renewal_peer_comms): an
+        # arrived robot's beacon -- believed x, y, conf in slots 0-2, the
+        # honest-beacon layout -- else silent.
+        if cfg.motor_override == "renewal_oracle" and getattr(cfg, "renewal_peer_comms", False):
+            b = getattr(worker, "renewal_beacon", {}).get(a, {}).get(l)
+            actions[i, :MESSAGE_SIZE] = 0.0
+            if b is not None:
+                actions[i, 0], actions[i, 1], actions[i, 2] = b[0], b[1], b[2]
     actions[:, MESSAGE_SIZE:] = motor
 
 
@@ -681,7 +702,7 @@ def act(buffer, policy, worker, decision_steps, cfg, rng, deterministic = False,
     walls = vector[:, 2 + SEED_SIZE:2 + SEED_SIZE + WALL_SIZE]
     _cache_spawn_heading(worker, cfg, vector, arena_ids, locals_, n)
 
-    if cfg.motor_override == "simple_oracle" and not bc_capture:
+    if cfg.motor_override in ("simple_oracle", "renewal_oracle") and not bc_capture:
         _drive_simple_oracle(worker, arena_ids, locals_, walls, cfg, rng, device,
                              wall_seed_xy_unity, actions, n, seeds = seeds, rows = rows)
         worker.set_actions(actions.numpy())
@@ -795,7 +816,7 @@ def act(buffer, policy, worker, decision_steps, cfg, rng, deterministic = False,
     if cfg.motor_override == "oracle":
         belief_heading = _belief_heading(worker, arena_ids, locals_, n, device)
 
-    if cfg.motor_override == "simple_oracle":
+    if cfg.motor_override in ("simple_oracle", "renewal_oracle"):
         # Only reached when bc_capture is True; otherwise the short-circuit at
         # the top of act() already returned. Calling the oracle here, rather
         # than duplicating what scripted/executed_motor/bc_target do below, is
@@ -805,10 +826,12 @@ def act(buffer, policy, worker, decision_steps, cfg, rng, deterministic = False,
         #
         # belief_attr differs from worker.belief because gather_split_state,
         # called just above for this same tick, reads and writes worker.belief
-        # itself -- sharing would corrupt whichever ran second.
+        # itself -- sharing would corrupt whichever ran second. The renewal
+        # flavor uses its own attr for the same reason (renewal_oracle.py,
+        # the amended-task baseline).
         import simple_oracle
         assert split_obs_actor, \
-            "simple_oracle is only wired for actor_type='gru_split_observation', not %r" % actor_type
+            "oracle motor overrides are only wired for actor_type='gru_split_observation', not %r" % actor_type
         # cfg.oracle_shared_event: the draw just above IS the tick's single
         # physical reception -- hand the oracle the same narrowed event the
         # stored tc encodes, so the (input, label) pair is consistent by
@@ -816,10 +839,17 @@ def act(buffer, policy, worker, decision_steps, cfg, rng, deterministic = False,
         shared_event = None
         if getattr(cfg, "oracle_shared_event", False):
             shared_event = (seed_narrowed, wall_narrowed, wall_seed_xy_narrowed)
-        scripted = simple_oracle.simple_oracle_motors(worker, arena_ids, locals_, walls, wall_seed_xy, cfg, rng,
-                                                      getattr(cfg, "_oracle_formation_pool", None),
-                                                      belief_attr = "simple_belief",
-                                                      shared_event = shared_event)
+        if cfg.motor_override == "renewal_oracle":
+            import renewal_oracle
+            scripted = renewal_oracle.renewal_oracle_motors(worker, arena_ids, locals_, walls, wall_seed_xy, cfg, rng,
+                                                            getattr(cfg, "_oracle_formation_pool", None),
+                                                            belief_attr = "renewal_belief",
+                                                            shared_event = shared_event)
+        else:
+            scripted = simple_oracle.simple_oracle_motors(worker, arena_ids, locals_, walls, wall_seed_xy, cfg, rng,
+                                                          getattr(cfg, "_oracle_formation_pool", None),
+                                                          belief_attr = "simple_belief",
+                                                          shared_event = shared_event)
     else:
         scripted = scripted_motors(node_b, cfg.motor_override, cfg.force_motor, assigned_dir = assigned_dir,
                                    stopped_mask = stopped_mask, belief_heading = belief_heading)

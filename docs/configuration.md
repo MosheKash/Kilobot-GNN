@@ -147,7 +147,7 @@ These change what a run does, for debugging rather than training. Most are descr
 | Variable | Default | Notes |
 |---|---|---|
 | `KILOBOT_MODE` | `rl` | `rl` trains normally. `bc`, `watch_oracle`, `probe`, `reward_probe`, `audit`, and `control` run diagnostics instead: `bc` clones the actor to the oracle controller by supervised regression rather than PPO; `watch_oracle` drives one arena via the oracle with no training at all, for `watch_oracle.sh`'s open-ended visual observation; `audit` checks the action path (executed action versus stored action, ratio); `control` forces fixed motor commands to measure control authority. `audit` and behavior cloning support all three actor types. All diagnostic modes run single-process regardless of `KILOBOT_NUM_WORKERS` (only `rl` uses the multi-worker path); see `docs/tuning.md`'s bug log if this ever routes into a full training run instead of a diagnostic. |
-| `KILOBOT_MOTOR_OVERRIDE` | `none` | Drives the environment from a scripted controller instead of the actor's policy. `simple_oracle` is the supported one -- `simple_oracle.py`'s five-state machine, and the behaviour-cloning teacher. `oracle` selects `actor_io.scripted_motors`, a separate belief-steered controller. `forward` and `fixed` (with `KILOBOT_FORCE_MOTOR`) are diagnostic. |
+| `KILOBOT_MOTOR_OVERRIDE` | `none` | Drives the environment from a scripted controller instead of the actor's policy. `simple_oracle` is the supported one -- `simple_oracle.py`'s five-state machine, and the behaviour-cloning teacher. `renewal_oracle` is the amended-task (wheel-slip) baseline, `renewal_oracle.py` -- see the phase-175 section below. `oracle` selects `actor_io.scripted_motors`, a separate belief-steered controller. `forward` and `fixed` (with `KILOBOT_FORCE_MOTOR`) are diagnostic. |
 | `KILOBOT_ORACLE_KNOWN_START_HEADING` | `0` (off); `1` in `watch_oracle.sh` specifically | Every robot spawns at the same, known heading instead of the usual random one, and the belief filter is told this directly rather than starting genuinely uncertain about heading. Confirmed directly to reproduce `true_heading`'s own exactness (removed as privileged, phase 70) through a legitimate, non-privileged mechanism instead -- a physically-enforceable setup convention plus already-exact `dtheta` tracking, not a live ground-truth readout -- as long as the real spawn heading genuinely matches (`Arena.spawn` on the replica side; `SwarmManager.cs`'s own `knownStartHeading` field, unverified from this environment, on the real-Unity side). Off by default in `Config` itself: validated in isolation and substantially at the real-pipeline level, but not yet at real scale the way phases 75-76 showed is necessary before trusting a belief-filter change generally. Added `docs/tuning.md` phase 77. |
 | `KILOBOT_ORACLE_ORBIT_AXIS_TRUST_THRESHOLD` | `0.3` | While orbiting a corner, discounts whichever axis (`conf_x`/`conf_y`, already computed from the particle cloud) is still below this per-axis confidence when computing the orbit direction, rather than trusting an axis with essentially no evidence behind it as much as one that's genuinely resolved. Confirmed directly this was needed: a robot arriving at a corner straight from wall-following had one axis resolved and one untouched, and trusting both equally centered its true orbit 15.9 raw units from the actual corner. Added `docs/tuning.md` phase 46.
 | `KILOBOT_ORACLE_SEND_VISUAL_STATE` | `false` | When true, sends a per-robot visual-state code over the existing `CriticChannel` side channel each tick, purely for a human watching real Unity to tell each kilobot's current oracle state at a glance -- never touches observations, actions, or reward. `watch_oracle.sh` turns this on by default; off everywhere else, including real training, where nothing listens for it and the cost is a no-op. States map to `simple_oracle.py`'s machine: 0=go_north (ivory), 1=turning (amber), 2=wall_following (gold), 3=navigating (deep red), 4=arrived (green). Seeds stay in a cool blue/teal family so infrastructure is never mistaken for a robot.
@@ -288,6 +288,48 @@ symbol.
 | `KILOBOT_HOP_COMMS` | `hop_comms` | `0` | The hop-count protocol: robots maintain IR-hop distances to the four corner seeds by min-relaxation over received message slots 0-3 and broadcast them; receivers fuse the counts as soft upper bounds on euclidean distance. Measured STRONGLY negative (0.337 vs A7's 0.691): box interiors give particles equal weight, so the cloud relocates toward the box intersection and tightens onto a confidently-wrong mean. Kept as documented negative; the prune-only variant is the untested remnant. |
 | `KILOBOT_RECV_GATE` | `recv_gate` | `0` | The learned RECEIVER: the policy's own message slot 3 maps to a trust gate g in [0,1] scaling that robot's fused-ring sigma by 1/g (g=1 = ungated exactly). Readout init plants g~0.98. Trained 100 iters: the gate never moved (pure PPO noise across ~370k decisions) -- no exploitable gradient at the substrate-required actor LR. Kept as documented negative. |
 | `KILOBOT_RESUME` | -- | unset | Path to a `ckpt.pt` to continue from. The checkpoint carries policy, critic, BOTH optimizer states, and the iteration counter; a resumed run's first iteration prints the restored EV (0.78+) and the original step count -- the verification that state carried over. |
+
+## Amended task: wheel slip and the renewal oracle (phase 175)
+
+True odometry noise in the player (`MotionNoise.cs`) and the oracle built
+for it (`renewal_oracle.py`, design in `docs/figures/renewal_oracle_v2_flow.tex`).
+Every slip dial defaults to 0, which leaves the player bit-identical to the
+exact-motion build. `simple_oracle.py` stays frozen. Rationale and the
+measurements are in `docs/tuning.md` phase 175. `tools/eval_closed_loop.py`
+takes the same dials as `--slip-bias/--slip-tick/--slip-seed/--motion-noise/--heading-noise`,
+and any `renewal_*` field via `--cfg FIELD=VALUE`.
+
+| Variable | Config field | Default | Meaning |
+|---|---|---|---|
+| `KILOBOT_SLIP_SIGMA_BIAS` | `slip_sigma_bias` | `0` | Per-robot persistent wheel mismatch, one draw per wheel at spawn, applied multiplicatively to the effective wheel speed (read by the player; mirrored on cfg for the log). |
+| `KILOBOT_SLIP_SIGMA_TICK` | `slip_sigma_tick` | `0` | Per-FixedUpdate random wheel slip, same form. |
+| `KILOBOT_SLIP_SEED` | `slip_seed` | `0` | Seeds the slip stream (a dedicated `System.Random`, never the spawn RNG). |
+| `KILOBOT_MOTION_NOISE` | `motion_noise` | `0` | Sets `belief.MOTION_NOISE`: the filter's position-noise model of the slip, so conf decays honestly as error accumulates. |
+| `KILOBOT_RENEWAL_HEADING_NOISE` | `renewal_heading_noise` | `0` | The renewal oracle's filter heading noise (predict/update `heading_noise_scale`). |
+| `KILOBOT_RENEWAL_WALL_EXIT_CONF` | `renewal_wall_exit_conf` | `0.5` | edge_follow -> navigate position-confidence bar (also needs sigma confirmed and an anchored heading). |
+| `KILOBOT_RENEWAL_CONF_MIN` | `renewal_conf_min` | `0.3` | navigate -> seek_wall renewal bar. |
+| `KILOBOT_RENEWAL_HEADING_DRIFT` | `renewal_heading_drift` | `0` | Heading-budget growth, rad per unit of path since the last fix; 0 never renews on heading. |
+| `KILOBOT_RENEWAL_HEADING_MAX` | `renewal_heading_max` | `0.35` | Renew when the heading budget exceeds this (rad). |
+| `KILOBOT_RENEWAL_HEADING_FIX_SIGMA` | `renewal_heading_fix_sigma` | `0.03` | The budget right after a fix (rad). |
+| `KILOBOT_RENEWAL_ANCHOR_DIST` | `renewal_anchor_dist` | `40` | Path since the last fix that still counts as anchored for the exit (u). |
+| `KILOBOT_RENEWAL_TRACK_ENTER` | `renewal_track_enter` | `5.0` | approach -> track once the windowed seed-line offset is this close (u). |
+| `KILOBOT_RENEWAL_OFFSET_SET` | `renewal_offset_set` | `4.0` | Tracking setpoint offset from the seed line (u), inside it and clear of the wall gap. |
+| `KILOBOT_RENEWAL_CONV_LEN` | `renewal_conv_len` | `16` | Path over which a pivot aims to reach the setpoint (u). |
+| `KILOBOT_RENEWAL_ALPHA_CMD_MAX` | `renewal_alpha_cmd_max` | `0.35` | Largest commanded angle off the tangent (rad). |
+| `KILOBOT_RENEWAL_PIVOT_MAX` | `renewal_pivot_max` | `0.785` | Largest single pivot (rad); also the no-peak / pressed recovery pivot. |
+| `KILOBOT_RENEWAL_PIVOT_MIN` | `renewal_pivot_min` | `0.02` | Smaller corrections are skipped (rad). |
+| `KILOBOT_RENEWAL_PEAK_MARGIN` | `renewal_peak_margin` | `0.5` | Distance rise above the running minimum that calls a seed pass (u). |
+| `KILOBOT_RENEWAL_PEAK_MIN_GAP` | `renewal_peak_min_gap` | `4.0` | Minimum path between peaks (u; seeds are 8u apart). |
+| `KILOBOT_RENEWAL_NOPEAK_PATH` | `renewal_nopeak_path` | `20` | Path with no seed pass -> pushing/veering recovery pivot (u). |
+| `KILOBOT_RENEWAL_GAP_LO` / `_GAP_HI` | `renewal_gap_lo` / `renewal_gap_hi` | `2.7` / `3.05` | The wall-gap offset window (a robot pressed on the wall reads ~2.9u): two flat peaks inside it = pressed; segments inside it never feed a heading fix. |
+| `KILOBOT_RENEWAL_FIX_PEAKS` | `renewal_fix_peaks` | `3` | Consecutive per-segment heading corrections per fix. |
+| `KILOBOT_RENEWAL_FIX_SPREAD_MAX` | `renewal_fix_spread_max` | `0.17` | They must agree within this (rad). |
+| `KILOBOT_RENEWAL_FIX_ALPHA_MAX` | `renewal_fix_alpha_max` | `0.35` | Steeper segments are not used for fixes (rad). |
+| `KILOBOT_RENEWAL_ARC_INNER` | `renewal_arc_inner` | `0.6` | Inner wheel of the approach arc. |
+| `KILOBOT_RENEWAL_TREND_ALPHA` | `renewal_trend_alpha` | `0.3` | EMA weight for per-side strength and the followed side's distance. |
+| `KILOBOT_RENEWAL_STALE_TICKS` | `renewal_stale_ticks` | `60` | Followed side unheard this long -> back to approach; neighbours unheard this long cannot trigger a corner. |
+| `KILOBOT_RENEWAL_LOST_TICKS` | `renewal_lost_ticks` | `600` | ... this long -> give up the wall (seek_wall). |
+| `KILOBOT_RENEWAL_FLIP_TURN` | `renewal_flip_turn` | `4.712` | Response test: approach-arc turn (rad) without the wall getting closer before sigma flips. |
 
 ## Run summary
 

@@ -12470,3 +12470,309 @@ still gated on its own probe cell).
 - launch.py's cfg-field test (the oracle_orbit_axis_trust_threshold
   regression) caught veto_init the same way it was built to: wire the
   env var, DECLARE the field.
+
+## 2026-10-20/21 (phase 175): the amended task -- true wheel slip, the frozen oracle's collapse under it, and the renewal oracle rebuilt until it holds parity without slip and beats the frozen oracle with it
+
+Owner direction (2026-10-20): amend the information structure so that
+information goes stale and communication has a gradient. Amendment
+implemented: **true wheel slip** in the player (`MotionNoise.cs`,
+`KilobotMovement.cs`): per-robot persistent wheel bias
+(`KILOBOT_SLIP_SIGMA_BIAS`, one draw per wheel at spawn) and per-tick
+random slip (`KILOBOT_SLIP_SIGMA_TICK`), both multiplicative on the
+effective wheel speed, on a dedicated seeded stream (`KILOBOT_SLIP_SEED`).
+All dials 0 = the historical exact-motion player, bit-identical. Owner
+rules recorded this phase: no commits; the oracle must use only the RL
+policy's inputs; oracle-specific inferred state (the wall-side bit,
+heading fixes, calibration) stays **private to the oracle** and is never
+added to the shared estimator or the actor's observation.
+
+### Infrastructure fixed on the way
+
+- `MotionNoise.cs` called two private `SwarmManager` helpers -- the player
+  did not compile. Made `internal`; the float parse is now invariant-culture.
+- The build failed on a stale `Library/Bee` (absolute paths from the
+  project's old location); cleared, both players rebuilt. New
+  `BuildPlayer.BuildLinuxHeaded` -> `Builds/headed/Kilobot.x86_64`.
+- `eval_closed_loop.py`: `--slip-bias/--slip-tick/--slip-seed/
+  --motion-noise/--heading-noise`, a generic `--cfg FIELD=VALUE`,
+  `--debug-wall-log`; `--mode renewal`'s stopped flags were never counted
+  (fell into the actor branch). `watch_oracle.sh` takes
+  `ORACLE=renewal_oracle`; `diagnostics.watch_oracle` silently replaced it
+  with `simple_oracle` before.
+- Slip verified live: `MotionNoise ON` in the player log; positions
+  diverge 17u in 400 ticks at bias 0.05.
+
+### A simulator bug found on the way: near-corner seed positions were WORLD, not arena-local
+
+`SwarmManager` broadcast a near-corner wall seed's own position as
+`transform.position` (world). Python treats every position as
+arena-local. `SceneBootstrap` places arenas on a 260u grid (arena 0 at the
+origin, 1 at (260,0), 2 at (0,260), 3 at (260,260)), so the broadcast pins
+were correct only in arena 0: one axis 260u off in arenas 1-2, both in
+arena 3. The filter's along-wall term (`_wall_along_log_w`) pulled every
+cloud toward those impossible points. Measured (renewal oracle, 4 arenas,
+same run): exit position error, median, by arena 5.1 / 9.6 / 12.5 / 24.4u
+before, 5.0 / 5.1 / 5.0 / 4.0u after. It is the explanation for the frozen
+oracle's per-arena pattern (0.93 / 0.35 / 0.35 / 0.00 settled) and for
+arena 3 "defeating every oracle". Fixed (subtract the arena origin, as
+`AppendNode` already does for robot positions); both players rebuilt.
+**Every multi-arena number recorded before the fix is affected** -- it
+reached the actor's inputs too (A7 and the earlier phases' harness
+numbers, wherever near-corner pins were in play), and the comparison tables
+below that predate the fix are kept for the record but superseded by the
+re-baseline at the end of this entry.
+
+### The frozen oracle collapses under slip (the amendment bites)
+
+Paired harness (4 arenas, 187 robots, 8000 ticks, 2 filter seeds; settled =
+stopped within 5u of the assigned point):
+
+| slip | frozen `simple_oracle` |
+|---|---|
+| none | 0.369 (0.364 / 0.374) |
+| s1 (bias 0.002, tick 0.02) | 0.059 |
+| s2 (bias 0.005, tick 0.05) | 0.016 |
+
+(s1/s2 shown at the physically derived filter settings, below; the first
+sweep's larger settings gave 0.056 / 0.024 -- the frozen oracle's heading
+is never corrected, so filter settings barely matter to it.) Per arena,
+arena 0 is the easy one (frozen: 0.93 / 0.15 / 0.05) and arena 3 (60
+robots) defeats every oracle. Mechanism, measured with a turn diagnostic:
+a robot meets its first wall at an angle (median tangent error 4.5 / 9.2 /
+13.4 degrees at none/s1/s2, >45 degrees for 13-19% of turns even without
+slip), and its dead-reckoned heading is wrong by up to 22 / 47 degrees
+(p90, s1/s2) with nothing ever correcting it.
+
+Physical filter settings, from the slip model (heading noise per tick
+~0.089 x sigma_tick; straight-line drift = (pi/4) x wheel-bias
+difference ~ 0.0022 rad/u at s1): s1 motion-noise 0.02, heading-noise
+0.002, drift budget 0.002 rad/u; s2 0.04 / 0.005 / 0.004.
+
+### The renewal oracle: what was built, and the order the failures came in
+
+Every claim below is a 1-arena quick run (arena 0, 41 robots, 8000 ticks)
+unless marked harness; the frozen oracle on the identical quick setup
+settles **38 / 4 / 0** of 41. Single-arena differences of +-3 robots are
+within run-to-run noise -- several intermediate "wins" were not real.
+
+1. **v1 as found**: the wall band controller's sign was inverted (a robot
+   that heard its wall too far away steered to the arena centre and never
+   came back). Fixed; still unusable (harness 0.056 / 0.024 / 0.003): the
+   band (1.5-3.5u from the seed line) overlapped the ~2.9u gap between the
+   seed line and the physical wall, and robots slid along the wall.
+2. **A continuous band/trend controller cannot work close to the wall.**
+   Wall seeds sit 5u inside the wall, 8u apart; the distance to the nearest
+   seed ripples between y and sqrt(y^2 + 16), more than the robot's own
+   motion changes it. Robots orbited single seeds or pressed the wall.
+3. **Seed-pass control** (the design approved via the flowchart): the
+   closest approach at each seed pass is the clean measurement; two
+   consecutive peaks give the angle off the wall from geometry,
+   alpha = atan(dy / 8 dk), which is also a heading measurement. Heading
+   fixes from it took the true heading error at the fix from 15 / 45
+   degrees (p50 / p90, s1) to 1.4 / 3.8 degrees. Corners confirm the
+   travel direction (the wall-side bit sigma); guards were needed for stale
+   neighbour signals, receding neighbours, and slides along the wall
+   (a slide reads alpha ~0 whatever the heading -- fixes from
+   wall-gap offsets are refused).
+4. **The shared filter's wall model is biased**: `belief._wall_log_w`
+   treats the range to the nearest seed POINT as the perpendicular distance
+   to the seed LINE. Between seeds that pulls the cloud inward by up to
+   sqrt(y^2 + 16) - y. Not changed (shared with the actor and the frozen
+   baselines -- worth an owner decision). The oracle got an optional
+   private filter step instead (point-range likelihood, inner-side prior,
+   out-of-box likelihood, process noise per unit travel): with the
+   seed-pass controller it is decisive (21 vs 4 of 41) -- but see 6.
+5. **Exits were confidently wrong along the wall** (30-126u at s2): a hard
+   arena clamp stacked an along-wall cloud on the end wall's line and
+   reported conf ~1.0 up to 100u from the truth (replaced by an out-of-box
+   likelihood); separately, contact made odometry advance while the robot
+   was held.
+6. **The decomposition that found the no-slip gap**: rebuilding the frozen
+   oracle's behaviour inside the renewal oracle and adding pieces back one
+   at a time (none / quick): frozen-like tangent steering + shared filter +
+   exit at conf 0.4 = 30/41; + arrival at 1.5u (not "within 5u", which
+   puts residual error on the wrong side of the bar half the time) = 35/41;
+   + private filter = 24/41. Tangent steering keeps the heading essentially
+   exact without slip (exit-heading p90 0.1 degrees vs ~3 with per-seed
+   pivots, whose contact rotates robots); the per-seed fix noise floor
+   (~2-3 degrees) is worse than exact dead reckoning, and on 150u legs that
+   alone missed the 5u bar.
+7. **The current default** ("tangent" controller): the frozen oracle's
+   tangent wall-following, steered toward a heading GOAL set at each seed
+   pass (a smooth version of the pivot: aim for a 5.5u offset over 16u,
+   from the measured offset and angle), aimed 4 degrees into the wall
+   until feedback exists, with seed-pass heading fixes; a robot leaves the
+   wall when the shared filter's conf >= 0.4 and its heading is anchored
+   (a recent fix, or a heading budget <= 0.1 rad -- always true without
+   slip); arrival at 1.5u believed. Quick: **36 / 10 / 3** vs the frozen
+   oracle's 38 / 4 / 0.
+
+### Measured out (kept as switches, default off)
+
+- Per-robot wheel-bias calibration (`renewal_calib_sigma_b`): under the
+  seed-pass controller the heading measurements carry a systematic error
+  (pivots, contact) the slip model does not describe; the regression
+  absorbed it as fake bias (b_L ~ +0.005-0.014 with no slip) and no-slip
+  settled fell 16 -> 1. Re-tested under the tangent default: the estimates
+  are now sane (+-0.0006 with no slip -- the pivots WERE the error source)
+  but quick settled still did not improve (none 36 -> 23, s1 9 -> 10,
+  s2 3 -> 2).
+- Sigma from heading at the turn without a corner: loses the corner's
+  along-wall pin (side-only seeds are ambiguous modulo 8u); exits mid-wall
+  on a wrong period.
+- Seed counting as along-wall odometry: fixed s2's along tails but
+  miscounted by about one seed at s0/s1.
+- Riding the wall toward the target; applying the pre-corner fix at the
+  corner; Kalman-blending fixes; a hard arena clamp; tangent mode's sigma
+  only under a heading budget (s1 10 -> 6, s2 3 -> 0).
+
+### Inputs
+
+The oracle reads only the per-tick single reception (wall strengths and
+broadcast seed positions, corner-seed strengths), its own motor commands
+and timing (odometry), its assigned target (the same `ensure_target` cache
+the actor's relative-target input uses) and the known spawn heading. Unity's
+true pose is read only inside `oracle_debug_wall_log` diagnostics, enforced
+by `test_the_oracle_never_reads_true_pose_outside_debug`.
+
+### Harness, current default (renewal v4, `results/slip_sweep_p175/renewalv4_*`)
+
+| slip | frozen oracle | renewal v4 (fs7 / fs1) | |
+|---|---|---|---|
+| none | 0.369 | 0.358 (0.364 / 0.353) | parity (-0.011, inside +-0.03) |
+| s1 | 0.059 | **0.096** (0.118 / 0.075) | 1.6x |
+| s2 | 0.016 | **0.045** (0.070 / 0.021) | 2.8x |
+
+Per arena (fs7): arena 0 0.80 vs 0.93 / 0.29 vs 0.12 / 0.17 vs 0.05;
+arenas 1-2 at or above the frozen oracle at every level; arena 3 (60
+robots) ~0 for both. The open weakness is completion under slip: 40% (s1)
+and 84% (s2) of robots are still moving at tick 8000, nearly all of them
+cycling through heading-budget renewals (each a ~1000-tick wall cycle).
+Renewal policy is not the lever: renewing only while the remaining blind
+distance can still cost a miss (`renewal_renew_miss`, kept, neutral) and a
+looser heading budget (0.6 rad: more arrivals, less accurate) both left
+quick settled unchanged (9-10/41 at s1, 3/41 at s2). The non-communicating
+oracle's ceiling under slip is the blind mid-arena leg -- exactly the gap
+the amendment opens for peers.
+
+### Where unfinished robots are under slip, and two completion levers that do not help
+
+Per-robot final states (quick, s1 / s2): 19 / 7 arrived, ~10 / ~16 in
+edge_follow, **10 / 16 in seek_wall** -- pinned against the robots already
+parked at the shape: no collision detection, so odometry keeps "driving"
+toward a wall it never reaches and the belief walks out to the boundary.
+A per-robot renewal cap (`renewal_max_renewals`) changes nothing (no robot
+renews more than twice; cap 0 stops more but settles the same). A seek
+timeout with an escape turn and a widened cloud (`renewal_seek_timeout`,
+600 ticks) fires 233-322 times a run and does not help (36/9/3 -> 33/8/3):
+escaped robots re-pin on the same crowd. A peer sidestep (contact-range
+peer heard persistently -> quarter turn + 6u straight, `renewal_sidestep`)
+fires 160-185 times a run and hurts (36/9/3 -> 23/6/5): near the shape
+robots are always at contact range of peers whose targets sit next to
+theirs. All three kept as switches, off.
+
+### The simple peer oracle (owner sign-off 2026-10-21: simple, no state machine)
+
+`renewal_peer_comms`: an arrived robot broadcasts its believed x, y and conf
+in slots 0-2 (the honest-beacon layout) when conf >= `renewal_peer_conf_min`;
+a travelling robot whose single reception is such a beacon fuses it as a
+range landmark (ring width from the sender's own conf, NOT the shared
+filter's 12u actor-protection floor) behind an innovation gate. It fires
+plenty -- 6830 / 2758 / 1720 beacons heard per quick run (none/s1/s2, at a
+0.5 sender gate) -- and does not help: quick settled 36 -> 32, 9 -> 7,
+3 -> 3. The project's position-claim lesson again (phases 168-172):
+under slip the arrived senders are themselves several units off and
+broadcast it confidently; a receiver at the shape trades its own drift for
+the sender's error. Making it help needs sender curation or consensus --
+the communication state machine the owner ruled out. Default off.
+
+The oracle code as run is archived next to the results
+(`renewal_oracle_v{2,3,4}_as_run.py`).
+
+### Re-baseline on the corrected player (`results/slip_sweep_p175/fix_*`)
+
+After the world-vs-local fix, same harness (4 arenas, 187 robots, 8000
+ticks, filter seeds 7 / 1):
+
+| slip | frozen `simple_oracle` | renewal (tangent default) |
+|---|---|---|
+| none | **0.813** (0.829 / 0.797) | 0.786 (0.797 / 0.775) |
+| s1 | 0.094 (0.080 / 0.107) | **0.214** (0.214 / 0.214) |
+| s2 | 0.040 (0.037 / 0.043) | **0.086** (0.086 / 0.086) |
+
+The frozen oracle without slip more than doubles (0.369 -> 0.813) and is
+now consistent across arenas (0.93 / 0.91 / 0.67 / 0.82); the earlier
+"arena 3 defeats every oracle" was the bug. The renewal oracle sits at
+the edge of the noise floor without slip (-0.027) and is 2.2-2.3x the
+frozen oracle under slip. (The renewal cells' identical seed pairs at
+s1/s2 are a coincidence of counts -- 40/187 and 16/187 both times; the
+runs' logs differ from tick 200 on, so the seeds are genuine.)
+
+### The baseline table, and mid-arena landmark beacons (owner sign-off 2026-10-21)
+
+Landmarks: four stationary beacons at (+-45, +-45), corner seeds kept, each
+broadcasting its own position over the neighbour message channel (an
+honest-beacon row: slots 0-1 position, slot 2 conf 1.0, slot 8 flag) --
+`KILOBOT_LANDMARKS=1`, `SwarmManager.SpawnLandmarks`; observation width
+unchanged. The renewal oracle fuses landmark rows as 1.4u range rings and,
+under drift, detours through one only when it is ON THE WAY (<= 15u extra;
+a 40u budget made detours that rarely finished). Distance bands, % of ALL
+robots that stopped within each distance of their assigned point (4 arenas
+x 187 robots x 8000 ticks, both filter seeds; `results/slip_sweep_p175/`
+`fix_*` and `lm_*`):
+
+| map | oracle | slip | <= 2u | <= 5u | <= 8u | <= 10u | <= 20u | stopped > 20u | still moving | <= 5u at tick 4000 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| corner seeds | frozen | none | 12% | 81% | 99% | 99% | 99% | 1% | 0% | 42% |
+| corner seeds | frozen | s1 | 1% | 9% | 20% | 25% | 45% | 49% | 6% | 7% |
+| corner seeds | frozen | s2 | 1% | 4% | 11% | 13% | 23% | 42% | 35% | 3% |
+| corner seeds | new | none | 27% | 79% | 94% | 95% | 95% | 2% | 2% | 35% |
+| corner seeds | new | s1 | 3% | 21% | 34% | 39% | 50% | 9% | 41% | 11% |
+| corner seeds | new | s2 | 2% | 9% | 14% | 16% | 20% | 1% | 79% | 2% |
+| corners + landmarks | frozen | none | 13% | 71% | 94% | 95% | 97% | 3% | 0% | 38% |
+| corners + landmarks | frozen | s1 | 1% | 11% | 19% | 24% | 42% | 53% | 5% | 7% |
+| corners + landmarks | frozen | s2 | 0% | 4% | 10% | 12% | 23% | 45% | 32% | 3% |
+| corners + landmarks | new | none | 26% | 76% | 90% | 92% | 95% | 3% | 2% | 32% |
+| corners + landmarks | new | s1 | 6% | 21% | 31% | 34% | 44% | 9% | 47% | 10% |
+| corners + landmarks | new | s2 | 2% | 10% | 15% | 16% | 22% | 3% | 75% | 5% |
+
+The landmarks do not move the renewal oracle (s1 21% -> 21%, s2 9% -> 10%
+within 5u) and cost both oracles 3-10 points without slip (landmark rows
+compete for the single receiver near the beacons). Four beacons cover only
+robots passing within 7u; detours that complete give good fixes but are
+too few. The owner's sparsity concern, measured. Baseline to beat: corner
+seeds, renewal oracle -- 79% / 21% / 9% within 5u at none / s1 / s2.
+
+Commit deadline (`renewal_commit_tick`, off): past tick 6000 every
+unfinished robot heads for its point on its best estimate and stops.
+Stopped rises (s1 46% -> 66%, s2 17% -> 41%) but settled barely moves
+(quick 9 -> 9, 3 -> 5): the committed robots' beliefs are already off
+(median arrival error 7.0u / 13.6u). The unfinished robots are not near
+their targets in belief either -- completion and accuracy are the same
+problem, the blind leg.
+
+### Information ceiling per noise level (`results/slip_sweep_p175/ceil_*`)
+
+How much could better mid-arena information buy at each noise level? A
+DIAGNOSTIC-only switch (`renewal_cheat`, reads Unity's true pose, off by
+default) hands a navigating robot its true heading ("heading") or true
+heading and position ("full"); the oracle's own controller and stopping
+rule are unchanged. 4 arenas, 187 robots, 8000 ticks, filter seed 7;
+% of all robots stopped within 5u:
+
+| noise | normal | + true heading | + true heading & position | gap (full - normal) | still moving normal / full | within 5u by tick 4000 normal / full |
+|---|---|---|---|---|---|---|
+| none | 80% | 90% | 99% | +20 | 2% / 1% | 36% / 42% |
+| 1/4 medium (bias 0.0005) | 51% | 80% | 95% | +44 | 5% / 5% | 27% / 39% |
+| 1/2 medium (bias 0.001) | 40% | 68% | 88% | +48 | 13% / 12% | 23% / 37% |
+| medium (s1) | 21% | 44% | 66% | +45 | 44% / 34% | 12% / 28% |
+| high (s2) | 9% | 19% | 35% | +26 | 79% / 65% | 1% / 9% |
+
+The controller is not the limit: with perfect mid-arena information it
+reaches 88-99% up to 1/2 medium. Heading alone recovers about 60% of the
+gap. At medium and above even perfect information leaves a third or more
+of robots unfinished (the information is used only while navigating; the
+wall phase and crowding still cost time), so those levels test more than
+communication. The 1/4-1/2 medium band keeps the oracle working for about
+half its robots while leaving the largest margin (+44-48 points) for
+better information -- the recommended regime for the amended task.

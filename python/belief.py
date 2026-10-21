@@ -33,6 +33,11 @@ ARENA_HALF = 100.0
 SPAWN_LIMIT = 0.9
 SEED_LAYOUTS = {
     "corners": [[-0.9, 0.9], [0.9, 0.9], [-0.9, -0.9], [0.9, -0.9]],
+    # "quarters" (phase 175, owner-requested experiment): the four seeds as
+    # sparse MID-ARENA landmarks at the quarter points instead of the
+    # corners -- same count, so SEED_SIZE (the actor's input width) is
+    # unchanged; corners keep their pin through the near-corner wall seeds.
+    "quarters": [[-0.45, 0.45], [0.45, 0.45], [-0.45, -0.45], [0.45, -0.45]],
     "cluster": [[0.22, 0.0], [0.11, 0.19], [-0.9, 0.9], [0.9, -0.9]],  # DEPRECATED, DO NOT USE -- not run in a long time. "corners" is the only supported layout; kept only for backward compatibility with old references and tests, not an alternative worth choosing.
 }
 SEED_POS = torch.tensor(SEED_LAYOUTS["corners"])

@@ -29,6 +29,15 @@
 #   ./scripts/watch_oracle.sh
 #   ./scripts/watch_oracle.sh corners 1 5
 #   KILOBOT_ORACLE_DEBUG_WALL_LOG=1 ./scripts/watch_oracle.sh corners 1 1
+#
+# ORACLE=renewal_oracle watches the amended-task (noisy-odometry) baseline
+# instead; pair it with the slip dials, which pass straight through to the
+# player and launch.py, and the headed build:
+#   ORACLE=renewal_oracle KILOBOT_BUILD_PATH=../Builds/headed/Kilobot.x86_64 \
+#   KILOBOT_SLIP_SIGMA_BIAS=0.002 KILOBOT_SLIP_SIGMA_TICK=0.02 \
+#   KILOBOT_MOTION_NOISE=0.05 KILOBOT_RENEWAL_HEADING_NOISE=0.01 ./scripts/watch_oracle.sh
+# Renewal colours: ivory=seek_wall, amber=wall_follow, gold=turn/unstuck,
+# deep red=navigate, green=arrived.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -48,7 +57,8 @@ elif [ -d "$FORMATION_DIR" ]; then
     FORMATION_DIR="$(cd "$FORMATION_DIR" && pwd)"
 fi
 
-echo "watching simple_oracle.py on $NUM_ARENAS arena(s), seed_layout=$SEED_LAYOUT, time_scale=$TIME_SCALE, no training"
+ORACLE="${ORACLE:-simple_oracle}"
+echo "watching $ORACLE on $NUM_ARENAS arena(s), seed_layout=$SEED_LAYOUT, time_scale=$TIME_SCALE, no training"
 if [ "$NUM_ARENAS" -gt 2 ]; then
     echo "note: >2 arenas with graphics on is untested territory -- if the window never appears, this is why"
 fi
@@ -56,7 +66,7 @@ echo "a Unity window should open shortly; if not, check KILOBOT_BUILD_PATH point
 echo "Ctrl+C to stop"
 echo ""
 
-env KILOBOT_MODE=watch_oracle KILOBOT_MOTOR_OVERRIDE=simple_oracle \
+env KILOBOT_MODE=watch_oracle KILOBOT_MOTOR_OVERRIDE="$ORACLE" \
     KILOBOT_MAX_FORMATIONS=1 \
     KILOBOT_MAX_EPISODE_STEPS=1000000000 KILOBOT_SUCCESS_THRESHOLD=1.1 \
     KILOBOT_NUM_ARENAS="$NUM_ARENAS" KILOBOT_NO_GRAPHICS=false KILOBOT_TIME_SCALE="$TIME_SCALE" \

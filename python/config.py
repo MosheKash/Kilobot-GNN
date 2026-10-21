@@ -240,6 +240,10 @@ class Config:
     # "cluster" exists in belief.SEED_LAYOUTS for backward compatibility only
     # and has not been run in a long time. Wall-lining seeds spawn regardless.
     seed_layout: str = "corners"
+    # mid-arena landmark beacons (phase 175, owner sign-off 2026-10-21):
+    # KILOBOT_LANDMARKS=1 in the player; their rows arrive in the neighbour
+    # message channel (renewal_oracle.LANDMARK_POS)
+    landmarks: bool = False
     # A robot that has gone this many decision ticks without an event still gets
     # a decision, with an all-zero event, so isolated robots can re-steer
     # instead of coasting ballistically. 0 disables. gru / gru_split_observation
@@ -605,6 +609,155 @@ class Config:
     # single-event physical agent. Turning this off with oracle_shared_event on
     # measurably degrades the oracle (twin audit, phase 162).
     oracle_fuse_seeds: bool = True
+
+    # ─── renewal oracle v2 (the amended-task baseline; simple_oracle.py stays
+    # frozen as the exact-motion baseline) ──────────────────────────────────
+    # Selected by KILOBOT_MOTOR_OVERRIDE=renewal_oracle; design in
+    # renewal_oracle.py's module docstring and
+    # docs/figures/renewal_oracle_v2_flow.tex. Distances are raw arena units.
+    # belief_conf = exp(-var / 0.02) in normalized units: 0.5 is a ~12u
+    # spread, 0.97 ~2u -- the settle bar is 5u, so the exit must be tight.
+    renewal_wall_exit_conf: float = 0.4   # edge_follow -> navigate position bar (hysteresis top);
+                                          # 0.97 with the private filter
+    renewal_conf_min: float = 0.3         # navigate -> seek_wall renewal bar (hysteresis bottom)
+    renewal_heading_noise: float = 0.0    # filter heading noise (0 = shared heading, as today)
+    # seed-pass controller (renewal_oracle.py loop 1). Offsets are the
+    # perpendicular distance from the followed side's wall-seed line, which
+    # sits 5u inside the wall; a robot's centre stops ~2.1u short of the
+    # wall, so the outer side reads at most ~2.9u -- the setpoint stays
+    # inside the seed line, clear of that gap.
+    # "seed_pass": the seed-pass controller (pivot per seed); "tangent": the
+    # frozen oracle's tangent steering by believed heading, with the heading
+    # kept right by passive seed-pass fixes (no per-seed pivots)
+    # the simple peer protocol (owner sign-off 2026-10-21): arrived robots
+    # broadcast believed x, y, conf (slots 0-2); travelling robots fuse a
+    # heard beacon as a range landmark behind an innovation gate
+    renewal_peer_comms: bool = False
+    renewal_peer_conf_min: float = 0.85   # sender gate (and receiver floor) on the beacon's conf
+    renewal_peer_gate: float = 0.1        # innovation gate: fraction of own particles within 2 sigma
+    renewal_controller: str = "tangent"
+    renewal_tangent_offset_set: float = 5.5  # tangent mode's setpoint offset (u): where tangent
+                                             # following naturally rides, clear of the wall gap
+    renewal_tangent_inward: float = 0.07     # rad toward the wall before seed-pass feedback exists
+    renewal_sigma_construct_max: float = 10.0  # tangent mode trusts sigma-by-construction only
+                                               # under this heading budget (rad); else the corner.
+                                               # 10 = always: 0.35 measured worse (s1 10->6, s2 3->0;
+                                               # waiting for corners costs more than rare wrong fixes)
+    renewal_track_enter: float = 5.0      # approach -> track once the windowed offset is this close
+    renewal_offset_set: float = 4.0       # tracking setpoint offset
+    renewal_conv_len: float = 16.0        # path over which a pivot aims to reach the setpoint
+    renewal_alpha_cmd_max: float = 0.35   # largest commanded angle off the tangent (rad)
+    renewal_pivot_max: float = 0.785      # largest single pivot (rad); also the no-peak recovery
+    renewal_pivot_min: float = 0.02       # smaller corrections are skipped (rad)
+    renewal_peak_margin: float = 0.5      # d must climb this far above the running min to call a peak
+    renewal_peak_min_gap: float = 4.0     # path between peaks (u): one peak per 8u seed
+    renewal_nopeak_path: float = 20.0     # path with no peak -> pushing / veering recovery pivot
+    # seed counting: each seed pass = exactly 8u along the wall; the cloud's
+    # along displacement between peaks is corrected to the count
+    renewal_count_max_path: float = 0.0   # longer segments are not counted (u); 0 = counting OFF
+                                          # (helped s2 tails, hurt s0/s1 by ~one seed; phase 175)
+    renewal_count_shift_max: float = 24.0 # largest single along correction (u)
+    renewal_arc_inner: float = 0.6        # inner wheel of the approach arc (outer = 1)
+    renewal_trend_alpha: float = 0.3      # EMA weight for per-side strength and followed-side distance
+    renewal_stale_ticks: int = 60         # followed side unheard this long -> back to approach
+    renewal_lost_ticks: int = 600         # ... this long -> give up the wall (seek_wall)
+    renewal_flip_turn: float = 4.712389   # response test: approach-arc turn (rad, 1.5 pi) before sigma flips
+    # heading re-anchor from the per-segment angles
+    renewal_fix_peaks: int = 3            # consecutive segment corrections per fix
+    renewal_fix_blend: bool = False       # Kalman-blend fixes against the dead-reckoned prior
+                                          # (measured: no clear gain, phase 175); False = hard reset
+    renewal_fix_meas_floor: float = 0.04  # per-segment heading measurement floor (rad), blend only
+    renewal_contact_sigma: float = 0.15   # heading sigma (rad) after a pressed / no-peak recovery
+    renewal_fix_spread_max: float = 0.17  # they must agree within this (rad, ~10 deg)
+    renewal_fix_alpha_max: float = 0.35   # segments steeper than this (rad) are not used
+    renewal_gap_lo: float = 2.7           # the wall-gap offset window (a robot pressed on the
+    renewal_gap_hi: float = 3.05          # wall reads ~2.9): pressed test + no fixes from slides
+    renewal_anchor_dist: float = 12.0     # path (u) since the last fix that still counts as anchored
+    renewal_anchor_heading_max: float = 0.1   # ...or the heading budget (rad) is still this small
+                                              # (with the seed-pass controller this lost at s0: its
+                                              # contact rotates robots; tangent mode keeps heading)
+    # the oracle's private filter step (renewal_belief_update)
+    renewal_pos_noise: float = 0.05       # position process noise per unit of travel (fraction)
+    renewal_meas_sigma: float = 0.01      # wall/seed point-range likelihood sigma (normalized; 1u)
+    renewal_private_filter: bool = False  # True: the oracle-private filter step (better for the
+                                          # seed-pass controller; worse in tangent geometry)
+    # odometry calibration (WheelBiasEstimator): per-robot wheel biases
+    # from pairs of consecutive segment heading measurements, removed from
+    # dead reckoning
+    renewal_calib_sigma_c: float = 0.03   # per-pair heading measurement noise (rad)
+    renewal_calib_sigma_b: float = 0.0    # ridge prior on each wheel bias; 0 = calibration OFF
+                                          # (measured net-negative at 0.002/0.01, phase 175)
+    renewal_calib_jump_max: float = 0.35  # larger pair changes are contact, not slip (rad)
+    renewal_calib_min_n: int = 4          # pairs before the budget uses the residual drift
+    renewal_calib_residual: float = 0.3   # once calibrated, budget drift = this * renewal_heading_drift
+    # heading budget (rad) under which the turn's heading confirms sigma
+    # without a corner. 0 = off: measured net-negative (phase 175) -- the
+    # corner also pins the ALONG-wall coordinate (near-corner seeds broadcast
+    # positions; side-only seeds are ambiguous modulo the 8u spacing), and
+    # without it robots exited mid-wall on a confidently wrong period.
+    renewal_sigma_from_heading_max: float = 0.0
+    # arrival
+    renewal_arrive_dist: float = 1.5      # believed distance (u) that counts as arrived
+    renewal_leg_err_max: float = 1e9      # under drift: keep riding the wall while the predicted
+                                          # leg miss drift*L^2/2 (u) exceeds this and the target is
+                                          # ahead. Off: 3.0 measured no gain (s1 10->8, s2 3->3)
+    renewal_near_dist: float = 10.0       # slow down inside this (u)
+    # heading budget (navigate renewal): sigma_theta = fix_sigma + drift * path since fix
+    renewal_heading_fix_sigma: float = 0.03
+    renewal_heading_drift: float = 0.0    # rad per unit of path; 0 = never renew on heading
+    renewal_heading_max: float = 0.35     # rad; renew when sigma_theta exceeds it
+    renewal_renew_miss: float = 4.0       # ...and sigma_theta * remaining distance (u) exceeds this
+    renewal_max_renewals: int = 2         # per robot; past it a robot commits to its best estimate
+    # DIAGNOSTIC ONLY -- reads true pose: "heading" / "full" hand a navigating
+    # robot its true heading / heading+position (an information upper bound)
+    renewal_cheat: str = "off"
+    renewal_commit_tick: int = 10 ** 9    # past this tick, unfinished robots head for their point on
+                                          # their best estimate and stop (no seeking, no renewals)
+    # seek timeout: pinned against parked peers, odometry lies (no collision
+    # detection) -- past this, turn away and widen the cloud
+    renewal_seek_timeout: int = 10 ** 9   # ticks in seek_wall without hearing a wall; off --
+                                          # 600 fired 233-322x/run, no gain (pinned robots re-pin)
+    renewal_seek_escape_turn: float = 2.0 # rad of the escape turn
+    renewal_seek_spread: float = 15.0     # u of position jitter added (position unknown)
+    # peer sidestep: pressed against a parked peer (heard at contact range,
+    # persistently) in seek_wall / navigate -> quarter-turn + short straight
+    # landmark detour (seed_layout "quarters"; under drift only): route a long
+    # leg through a mid-arena landmark -- range fixes position, the touch
+    # fixes heading from the leg's own displacement
+    renewal_detour: bool = True
+    renewal_detour_max: float = 15.0      # largest extra distance (u) a detour may add: ON THE WAY
+                                          # only (owner, 2026-10-21; 40u made detours that never finished)
+    renewal_detour_gain: float = 20.0     # it must shorten the final leg by at least this (u)
+    renewal_detour_leg_min: float = 40.0  # only legs longer than this (u) detour
+    renewal_touch_d: float = 5.0          # landmark range (u) that counts as touched (a kilobot is
+                                          # ~3.3u across: centres never get closer than ~3.3)
+    renewal_search_ticks: int = 500       # spiral search for an unheard landmark, then give up
+    renewal_sidestep: bool = False         # off: fired 160-185x/run near the shape (peers there are
+                                          # always at contact range) and cost 36->23 at s0, 9->6 at s1
+    renewal_sidestep_dist: float = 3.5    # peer range (u) that counts as contact
+    renewal_sidestep_count: float = 6.0   # close hearings (with decay) before a sidestep
+    renewal_sidestep_len: float = 6.0     # u of straight after the quarter turn
+
+    # ─── true odometry slip (Unity-side dials; the amended task's core
+    # amendment) ─────────────────────────────────────────────────────────────
+    # Python-side mirrors of the player env vars SwarmManager/MotionNoise
+    # parse from the same names, recorded on cfg so a launch is auditable and
+    # reproducible from its logs. sigma_bias: per-robot systematic wheel
+    # mismatch, drawn once per robot at spawn -- the linear-drift component
+    # only feedback loops can absorb. sigma_tick: per-FixedUpdate random slip
+    # -- the random-walk component. slip_seed: pins the noise stream (a
+    # dedicated System.Random, never the spawn RNG). All 0 = the historical
+    # exact-motion build, bit-identical.
+    slip_sigma_bias: float = 0.0
+    slip_sigma_tick: float = 0.0
+    slip_seed: int = 0
+    # The Python filter's motion-noise model: launch sets belief.MOTION_NOISE
+    # to this (sig_xy = MOTION_NOISE * move in belief_predict), so every
+    # particle filter honestly widens as error accumulates and conf decays.
+    # Under slip this must be at least the effective per-decision slip scale
+    # -- an optimistic filter here is exactly the old invisible-divergence
+    # failure mode KilobotMovement.cs's history comment warns about.
+    motion_noise: float = 0.0
 
     # ─── behaviour cloning ───────────────────────────────────────────────────
     # Force a random fraction of decisions to see h_prev=0, during oracle-driven

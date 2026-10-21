@@ -36,7 +36,7 @@ def watch_oracle(trainer, policy, cfg):
     # Forcing one unconditionally, as an earlier version did, silently
     # discarded whatever KILOBOT_MOTOR_OVERRIDE the launching script had set.
     # The fallback is simple_oracle, the supported teacher.
-    if cfg.motor_override not in ("oracle", "simple_oracle"):
+    if cfg.motor_override not in ("oracle", "simple_oracle", "renewal_oracle"):
         cfg.motor_override = "simple_oracle"
     print(f"watching {cfg.motor_override} drive, no training -- Ctrl+C to stop")
     trainer.setup()

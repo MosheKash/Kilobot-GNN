@@ -26,9 +26,20 @@ Recordings/
 
 # ─── Build output (reproducible from Assets/Editor/BuildPlayer.cs) ────────────
 Builds/
+# The player build creates Assets/Resources/ for the ML-Agents /
+# performance-test settings files and removes them again, leaving an empty
+# folder plus its .meta behind. This project loads nothing via
+# Resources.Load, so the folder is never real content. Remove these two
+# lines if you ever add assets that must be loaded by name at runtime.
+Assets/Resources/
+Assets/Resources.meta
 
 # ─── Generated datasets (reproducible from data-prep/) ────────────────────────
 data/formations/
+# Experiment results kept for the paper (not reproducible cheaply: hours of
+# harness time each). Permanent, local, never committed -- see the README
+# inside each folder.
+data/experiments/
 
 # ─── IDE ──────────────────────────────────────────────────────────────────────
 .vs/
